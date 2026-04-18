@@ -1,12 +1,24 @@
 # Windows Codex Stability Guardian
 
-Low-overhead Windows-native stability tooling for Codex CLI, Docker Desktop / WSL2, and Windows User Profile incidents.
+[![CI](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml)
+[![Release](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml)
 
-## Overview
+Windows-native local stability tooling for Codex CLI, Docker Desktop / WSL2, and Windows User Profile diagnostics.
 
-Windows Codex Stability Guardian is a local-first operations tool designed for a single Windows workstation. It focuses on recurring failure classes that are easy to misdiagnose as "data loss" but are often caused by drift in local state, runtime health, or user-profile locks.
+Guardian is a conservative workstation operations tool built for a very specific job: detect recurring local failure classes, classify them from live machine evidence, and only repair them when the repair path is known, bounded, and explicitly confirmed.
 
-The project ships a single Rust-based executable, `guardian.exe`, with CLI, tray, and GUI entry points. Its core design goals are:
+## Why this project exists
+
+Some workstation failures look like data loss, broken installs, or "just restart everything" incidents when they are actually caused by:
+
+- local state drift
+- stale SQLite rows
+- Docker / WSL baseline drift
+- user-profile locks or temporary-profile risk
+
+Guardian is designed to make those problems observable first and repairable second.
+
+Its operating principles are:
 
 - **Observe before repair**
 - **Backup before write**
@@ -14,11 +26,11 @@ The project ships a single Rust-based executable, `guardian.exe`, with CLI, tray
 - **Windows-native, low-overhead operation**
 - **No dependence on remote services**
 
-## What the tool does
+## What Guardian does
 
-### 1. Codex health and repair
+### Codex health and repair
 
-Guardian can inspect a local Codex home, classify common `/resume` failure modes, and execute a controlled stale-row repair flow when the failure matches the known drift pattern.
+Guardian can inspect a local Codex home, classify common `/resume` failure modes, and run a controlled stale-row repair flow when the known drift pattern is present.
 
 Key behaviors:
 
@@ -28,7 +40,7 @@ Key behaviors:
 - creates a SQLite backup before mutation
 - writes a structured repair audit after execution
 
-### 2. Docker / WSL baseline recovery
+### Docker / WSL baseline recovery
 
 Guardian inspects Docker Desktop, WSL state, and `.wslconfig`, then applies bounded recovery flows for known baseline or runtime anomalies.
 
@@ -39,7 +51,7 @@ Key behaviors:
 - blocks high-risk runtime restart flows when running containers make that unsafe
 - writes repair audits for confirm-mode actions
 
-### 3. Profile diagnostics
+### Profile diagnostics
 
 Guardian reads Windows profile-related event evidence and turns it into guided recovery steps without modifying the system.
 
@@ -50,26 +62,75 @@ Key behaviors:
 - detects when security software involvement is likely
 - exports structured diagnostic JSON
 
-### 4. Bundle export
+### Bundle export
 
 Guardian can export a support bundle containing current health output, profile diagnostics, and audit summaries.
 
-## Command surface
+## When to use it
 
-```text
-guardian.exe check
-guardian.exe repair codex
-guardian.exe repair docker
-guardian.exe diagnose profile
-guardian.exe export bundle
-guardian.exe gui
-guardian.exe tray
+Guardian is a good fit when you want:
+
+- a local-first Windows diagnostics tool
+- a safer alternative to ad hoc workstation repair scripts
+- structured health output before making system changes
+- bounded repair paths for recurring Codex or Docker / WSL issues
+
+Guardian is **not** positioned as:
+
+- a cloud service
+- a fleet-management platform
+- a generic Windows optimizer
+- an automatic registry fixer for user-profile corruption
+
+## Command overview
+
+| Command | Purpose | Mutation boundary |
+| --- | --- | --- |
+| `guardian.exe check` | Run workstation health checks | Read-only |
+| `guardian.exe repair codex` | Inspect and optionally repair known Codex drift | Requires `--confirm` for writes |
+| `guardian.exe repair docker` | Inspect and optionally repair Docker / WSL baseline/runtime issues | Requires `--confirm` for writes |
+| `guardian.exe diagnose profile` | Export profile-related diagnostics and guided recovery notes | Read-only |
+| `guardian.exe export bundle` | Export a support bundle from current health and audit data | Read-only with respect to monitored systems |
+| `guardian.exe gui` | Launch the desktop GUI | No automatic repair without explicit action |
+| `guardian.exe tray` | Launch the tray entry point | No automatic repair without explicit action |
+
+## Quick start
+
+### 1. Download a release
+
+Get the latest release assets from:
+
+- [Releases](https://github.com/ZRainbow1275/windows-codex-stability-guardian/releases)
+
+Each release publishes:
+
+- `guardian-v<version>-windows-x64.zip`
+- `guardian.exe`
+- `SHA256SUMS.txt`
+
+### 2. Verify what you downloaded
+
+Recommended verification flow:
+
+1. Verify the Git tag is shown as signed / verified on GitHub.
+2. Download the release zip and `SHA256SUMS.txt`.
+3. Verify the checksum locally:
+
+```powershell
+Get-FileHash .\guardian-v0.1.0-windows-x64.zip -Algorithm SHA256
 ```
 
-### Typical examples
+Compare the output against `SHA256SUMS.txt`.
+
+### 3. Start with a read-only health check
 
 ```powershell
 guardian.exe check --json
+```
+
+### 4. Escalate only when needed
+
+```powershell
 guardian.exe repair codex --dry-run --json
 guardian.exe repair codex --confirm --json
 guardian.exe repair docker --dry-run --json
@@ -88,38 +149,24 @@ Guardian is intentionally conservative:
 - profile diagnostics never auto-edit `ProfileList` or terminate security software
 - runtime restart flows for Docker / WSL are guarded by live machine state
 
-## Release artifacts
+## Operational data paths
 
-Release builds are packaged as Windows x64 zip archives containing:
+By default Guardian uses:
 
-- `guardian.exe`
-- `README.md`
-- `CHANGELOG.md`
-- `LICENSE`
+- audits: `%LOCALAPPDATA%\guardian\audits`
+- bundles: `%LOCALAPPDATA%\guardian\bundles`
+- backups: `%LOCALAPPDATA%\guardian\backups`
 
-Each release also generates:
+## Repository layout
 
-- `SHA256SUMS.txt`
-
-## Signing and verification
-
-This repository is prepared for:
-
-- **SSH-signed commits**
-- **SSH-signed tags**
-- **SHA256 release checksums**
-
-Recommended verification flow:
-
-1. Verify the GitHub tag is shown as signed / verified.
-2. Download the release zip and `SHA256SUMS.txt`.
-3. Verify the checksum locally:
-
-```powershell
-Get-FileHash .\guardian-v0.1.0-windows-x64.zip -Algorithm SHA256
-```
-
-Compare the output against `SHA256SUMS.txt`.
+| Path | Purpose |
+| --- | --- |
+| `apps/guardian/` | Main application entry points, CLI, tray, GUI, and packaging script |
+| `crates/guardian-core/` | Shared domain types, policies, and audit structures |
+| `crates/guardian-observers/` | Read-only machine evidence collection and classifiers |
+| `crates/guardian-repair/` | Repair orchestration, bundle export, and guarded write paths |
+| `crates/guardian-windows/` | Windows-specific helpers for paths, event logs, process execution, and registry-facing utilities |
+| `.github/workflows/` | CI and tag-driven release automation |
 
 ## Development
 
@@ -144,14 +191,6 @@ cargo test --workspace
 
 The packaging script writes artifacts under `dist\<version>\`.
 
-## Operational data paths
-
-By default Guardian uses:
-
-- audits: `%LOCALAPPDATA%\guardian\audits`
-- bundles: `%LOCALAPPDATA%\guardian\bundles`
-- backups: `%LOCALAPPDATA%\guardian\backups`
-
 ## Project status
 
 Current release line: **v0.1.0**
@@ -164,6 +203,14 @@ Implemented and wired:
 - profile diagnostics with guided recovery notes
 - bundle export
 - tray and GUI entry points
+
+## Security and privacy
+
+This public repository is intentionally kept free of machine-specific secrets, private session artifacts, and local workstation-only notes.
+
+See:
+
+- [SECURITY.md](./SECURITY.md)
 
 ## License
 
