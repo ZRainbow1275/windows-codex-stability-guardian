@@ -1,0 +1,11 @@
+[package]
+name = "guardian-observers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+guardian-core = { path = "../guardian-core" }
+guardian-windows = { path = "../guardian-windows" }
+rusqlite.workspace = true
+walkdir.workspace = true

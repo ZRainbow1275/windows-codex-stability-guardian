@@ -1,0 +1,15 @@
+[package]
+name = "guardian-repair"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+guardian-core = { path = "../guardian-core" }
+guardian-observers = { path = "../guardian-observers" }
+guardian-windows = { path = "../guardian-windows" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zip.workspace = true
