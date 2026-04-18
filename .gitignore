@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+/dist/
+
+# Local environment and AI harness state
+/.agents/
+/.claude/
+/.codex/
+/.gemini/
+/.serena/
+/.trellis/
+/prompts/
+/AGENTS.md
+/specs/
+
+# Misc local files
+*.log
+Thumbs.db
+.DS_Store
