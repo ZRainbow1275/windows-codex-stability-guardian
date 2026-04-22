@@ -316,7 +316,10 @@ fn current_codex_version() -> Option<String> {
 fn command_with_project_path(base: &str, project_path: Option<&Path>) -> String {
     project_path.map_or_else(
         || base.to_string(),
-        |path| format!("{base} --project-path {}", path.display()),
+        |path| {
+            let rendered = path.display().to_string().replace('"', "\\\"");
+            format!("{base} --project-path \"{rendered}\"")
+        },
     )
 }
 
@@ -580,9 +583,9 @@ mod tests {
         assert_eq!(
             command_with_project_path(
                 "guardian repair codex --confirm",
-                Some(Path::new(r"D:\Desktop\Inkforge")),
+                Some(Path::new(r"D:\Desktop\CREATOR SIX")),
             ),
-            r"guardian repair codex --confirm --project-path D:\Desktop\Inkforge"
+            r#"guardian repair codex --confirm --project-path "D:\Desktop\CREATOR SIX""#
         );
     }
 }
