@@ -11,6 +11,7 @@ use guardian_core::{
     types::{DomainReport, EvidenceItem, StatusLevel},
 };
 use guardian_windows::{
+    codex_config::{codex_config_path, missing_project_trust_keys},
     paths::{
         codex_home_dir, codex_state_db_candidates, codex_tui_log_candidates, latest_codex_state_db,
     },
@@ -19,6 +20,10 @@ use guardian_windows::{
 use rusqlite::Connection;
 
 pub fn observe() -> Result<DomainReport, GuardianError> {
+    observe_with_target(None)
+}
+
+pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, GuardianError> {
     let mut evidence = Vec::new();
     let mut notes = Vec::new();
     let mut status = StatusLevel::Ok;
@@ -118,7 +123,8 @@ pub fn observe() -> Result<DomainReport, GuardianError> {
         notes.push("No `state_*.sqlite` file was found under `.codex`.".to_string());
     }
 
-    match collect_codex_log_signals()? {
+    let log_signals = collect_codex_log_signals()?;
+    match &log_signals {
         Some(log_signals) => {
             evidence.push(EvidenceItem::new(
                 "codex_tui_log_path",
@@ -156,6 +162,58 @@ pub fn observe() -> Result<DomainReport, GuardianError> {
                 "No `codex-tui.log` was found under the expected `.codex/log` or `.codex` locations."
                     .to_string(),
             );
+        }
+    }
+
+    let config_path = codex_config_path().map_err(GuardianError::Io)?;
+    evidence.push(EvidenceItem::new(
+        "codex_config_path",
+        config_path.display().to_string(),
+    ));
+    evidence.push(EvidenceItem::new(
+        "codex_config_present",
+        config_path.exists().to_string(),
+    ));
+
+    if let Some(trust_target) = resolve_trust_target(project_path, log_signals.as_ref()) {
+        evidence.push(EvidenceItem::new(
+            "trust_target_path",
+            trust_target.path.display().to_string(),
+        ));
+        evidence.push(EvidenceItem::new(
+            "trust_target_source",
+            trust_target.source,
+        ));
+
+        let config_text = if config_path.exists() {
+            Some(std::fs::read_to_string(&config_path)?)
+        } else {
+            None
+        };
+        let config_text = config_text.as_deref().unwrap_or("");
+        match missing_project_trust_keys(config_text, &trust_target.path) {
+            Ok(missing_keys) => {
+                if !missing_keys.is_empty() {
+                    status = StatusLevel::Warn;
+                    failure_classes.push(FailureClass::C6);
+                    evidence.push(EvidenceItem::new(
+                        "trust_missing_lookup_keys",
+                        missing_keys.join(" | "),
+                    ));
+                    notes.push(format!(
+                        "Codex project trust is missing for `{}`; Guardian found {} expected lookup key(s) absent from `config.toml`.",
+                        trust_target.path.display(),
+                        missing_keys.len()
+                    ));
+                }
+            }
+            Err(error) => {
+                status = StatusLevel::Warn;
+                failure_classes.push(FailureClass::C5);
+                notes.push(format!(
+                    "Unable to parse `%USERPROFILE%/.codex/config.toml` while checking project trust: {error}"
+                ));
+            }
         }
     }
 
@@ -277,6 +335,7 @@ fn collect_codex_log_signals() -> Result<Option<CodexLogSignals>, GuardianError>
     let mut matches = Vec::new();
     let mut has_loading_sessions = false;
     let mut has_config_error = false;
+    let mut trust_project_path = None;
     for line in tail.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -289,6 +348,9 @@ fn collect_codex_log_signals() -> Result<Option<CodexLogSignals>, GuardianError>
 
         has_loading_sessions |= is_loading_sessions_signal(trimmed);
         has_config_error |= is_config_error_signal(trimmed);
+        if let Some(path) = extract_trust_warning_path(trimmed) {
+            trust_project_path = Some(path);
+        }
 
         matches.push(trim_log_line(trimmed));
     }
@@ -300,6 +362,7 @@ fn collect_codex_log_signals() -> Result<Option<CodexLogSignals>, GuardianError>
         matches,
         has_loading_sessions,
         has_config_error,
+        trust_project_path,
     }))
 }
 
@@ -325,7 +388,9 @@ fn is_codex_log_signal(line: &str) -> bool {
         return false;
     }
 
-    is_loading_sessions_signal(line) || is_config_error_signal(line)
+    is_loading_sessions_signal(line)
+        || is_config_error_signal(line)
+        || is_trust_warning_signal(line)
 }
 
 fn looks_like_tooling_echo(line: &str) -> bool {
@@ -347,6 +412,22 @@ fn is_config_error_signal(line: &str) -> bool {
     line.contains("Error loading configuration:")
         || line.contains("os error 5")
         || line.contains("拒绝访问。 (os error 5)")
+}
+
+fn is_trust_warning_signal(line: &str) -> bool {
+    line.contains("as a trusted project")
+        && line.contains("config.toml")
+        && line.contains("project-local config")
+}
+
+fn extract_trust_warning_path(line: &str) -> Option<PathBuf> {
+    let start = line.find(" add ")? + " add ".len();
+    let end = line.find(" as a trusted project")?;
+    let candidate = line[start..end].trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(candidate))
 }
 
 fn trim_log_line(line: &str) -> String {
@@ -393,4 +474,67 @@ struct CodexLogSignals {
     matches: Vec<String>,
     has_loading_sessions: bool,
     has_config_error: bool,
+    trust_project_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct TrustTarget {
+    path: PathBuf,
+    source: &'static str,
+}
+
+fn resolve_trust_target(
+    project_path: Option<&Path>,
+    log_signals: Option<&CodexLogSignals>,
+) -> Option<TrustTarget> {
+    if let Some(project_path) = project_path {
+        return Some(TrustTarget {
+            path: project_path.to_path_buf(),
+            source: "requested_project_path",
+        });
+    }
+
+    log_signals
+        .and_then(|signals| signals.trust_project_path.as_ref())
+        .map(|path| TrustTarget {
+            path: path.clone(),
+            source: "codex_tui_warning",
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{extract_trust_warning_path, is_trust_warning_signal, last_unique};
+
+    #[test]
+    fn trust_warning_signal_extracts_project_path() {
+        let line = "To load project-local config, hooks, and exec policies, add d:\\desktop\\inkforge as a trusted project in C:\\Users\\HP\\.codex\\config.toml.";
+        assert!(is_trust_warning_signal(line));
+        assert_eq!(
+            extract_trust_warning_path(line),
+            Some(PathBuf::from(r"d:\desktop\inkforge"))
+        );
+    }
+
+    #[test]
+    fn trust_warning_parser_ignores_unrelated_lines() {
+        assert!(!is_trust_warning_signal("Loading sessions..."));
+        assert_eq!(extract_trust_warning_path("plain text"), None);
+    }
+
+    #[test]
+    fn last_unique_keeps_latest_occurrence_order() {
+        let lines = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+        ];
+        assert_eq!(
+            last_unique(lines, 3),
+            vec!["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+    }
 }

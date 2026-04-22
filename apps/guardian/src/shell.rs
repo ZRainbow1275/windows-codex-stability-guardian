@@ -271,18 +271,64 @@ pub(crate) fn localized_report_note(note: &str) -> String {
     }
 
     if let Some(path) = note.strip_prefix(
-        "Codex confirm mode executed the trusted stale-row repair chain and persisted audit to ",
+        "Codex confirm mode executed the managed repair chain and persisted audit to ",
     ) {
-        return format!("Codex 确认修复已执行可信 stale-row 修复链，并将审计结果写入：{path}");
+        return format!("Codex 确认修复已执行托管修复链，并将审计结果写入：{path}");
     }
-    if note == "Dry-run only: the trusted Codex repair script was not executed." {
-        return "当前仅执行 dry-run：可信的 Codex 修复脚本尚未真正运行。".to_string();
+    if note == "Dry-run only: the managed Codex repair chain did not modify the environment." {
+        return "当前仅执行 dry-run：托管 Codex 修复链尚未对环境做出任何修改。".to_string();
     }
     if note
-        == "Codex repair is gated behind `--confirm`; use `--dry-run` to preview the live repair chain or `--confirm` to execute it with backup and audit."
+        == "Codex repair is gated behind `--confirm`; use `--dry-run` to preview the managed repair chain or `--confirm` to execute it with backup, verification, and audit."
     {
-        return "Codex 修复必须显式加上 `--confirm`；可先用 `--dry-run` 预览真实修复链，再用 `--confirm` 执行并生成备份与审计。"
+        return "Codex 修复必须显式加上 `--confirm`；可先用 `--dry-run` 预览托管修复链，再用 `--confirm` 执行备份、写后验证与审计。"
             .to_string();
+    }
+    if let Some(remainder) = note.strip_prefix("Codex project trust is missing for `")
+        && let Some((project_path, rest)) = remainder.split_once("`; Guardian found ")
+        && let Some(missing_count) =
+            rest.strip_suffix(" expected lookup key(s) absent from `config.toml`.")
+    {
+        return format!(
+            "Codex 项目 trust 对 `{project_path}` 缺失；Guardian 在 `config.toml` 中发现仍有 {missing_count} 个预期 lookup key 未补齐。"
+        );
+    }
+    if let Some(error) = note.strip_prefix(
+        "Unable to parse `%USERPROFILE%/.codex/config.toml` while checking project trust: ",
+    ) {
+        return format!("检查项目 trust 时无法解析 `%USERPROFILE%/.codex/config.toml`：{error}");
+    }
+    if let Some(path) = note.strip_prefix("Trusted project target: ") {
+        return format!("trust 修复目标项目：{path}");
+    }
+    if let Some(source) = note.strip_prefix("Trusted project source: ") {
+        let source = match source {
+            "requested_project_path" => "命令显式提供的项目路径",
+            "codex_tui_warning" => "Codex TUI trust 警告",
+            other => other,
+        };
+        return format!("trust 目标来源：{source}");
+    }
+    if let Some(path) = note.strip_prefix("Codex config backup created at ") {
+        return format!("Codex 配置备份已写入：{path}");
+    }
+    if let Some(keys) = note.strip_prefix("Trusted project keys appended: ") {
+        return format!("已补写 trusted project keys：{keys}");
+    }
+    if let Some(path) = note.strip_prefix("Trusted script executed: ") {
+        return format!("已执行可信修复脚本：{path}");
+    }
+    if let Some(version) = note.strip_prefix("Active Codex version after repair: ") {
+        return format!("修复后的活动 Codex 版本：{version}");
+    }
+    if let Some(path) = note.strip_prefix("SQLite backup created at ") {
+        return format!("SQLite 备份已写入：{path}");
+    }
+    if let Some(excerpt) = note.strip_prefix("Script stdout excerpt: ") {
+        return format!("脚本 stdout 摘要：{excerpt}");
+    }
+    if let Some(excerpt) = note.strip_prefix("Script stderr excerpt: ") {
+        return format!("脚本 stderr 摘要：{excerpt}");
     }
     if let Some(path) = note.strip_prefix(
         "Docker confirm mode completed the guarded Docker / WSL repair flow and persisted audit to ",
@@ -311,9 +357,9 @@ pub(crate) fn localized_report_note(note: &str) -> String {
         return format!("诊断压缩包已写入：{path}");
     }
     if note
-        == "Codex confirm repair is live, Docker D3 managed repair is live, guarded Docker/WSL runtime restart recovery for D1/D2/D4 is live when the machine can prove zero running containers, and profile event collection is live in read-only mode."
+        == "Codex confirm repair is live, trust drift detection is live, Docker D3 managed repair is live, guarded Docker/WSL runtime restart recovery for D1/D2/D4 is live when the machine can prove zero running containers, and profile event collection is live in read-only mode."
     {
-        return "Guardian 当前能力：Codex 确认修复已上线；Docker D3 托管修复已上线；当机器能证明当前没有运行中的容器时，Docker/WSL 针对 D1/D2/D4 的受保护运行时重启恢复可用；Profile 事件采集保持只读。"
+        return "Guardian 当前能力：Codex 确认修复已上线，项目 trust drift 检测已上线；Docker D3 托管修复已上线；当机器能证明当前没有运行中的容器时，Docker/WSL 针对 D1/D2/D4 的受保护运行时重启恢复可用；Profile 事件采集保持只读。"
             .to_string();
     }
 
@@ -322,7 +368,13 @@ pub(crate) fn localized_report_note(note: &str) -> String {
 
 pub(crate) fn localized_action_description(description: &str) -> String {
     match description {
-        "Preview the low-risk Codex repair chain." => "先预览低风险的 Codex 修复链路。".to_string(),
+        "Preview the Codex repair chain, including trust recovery when an untrusted project is identified." => {
+            "先预览 Codex 修复链路；如果识别到未受信任项目，还会一并展示 trust 恢复计划。"
+                .to_string()
+        }
+        "Execute the managed Codex repair chain with backup, verification, and audit." => {
+            "执行托管 Codex 修复链，并完成备份、写后验证与审计。".to_string()
+        }
         "Preview the Docker and WSL recovery chain." => {
             "先预览 Docker / WSL 恢复链路。".to_string()
         }
@@ -397,7 +449,10 @@ fn localized_profile_summary(summary: &str) -> String {
 mod tests {
     use guardian_core::types::{DomainReport, DomainReports, HealthReport, StatusLevel};
 
-    use super::{localized_detail_text, localized_domain_summary, localized_report_note};
+    use super::{
+        localized_action_description, localized_detail_text, localized_domain_summary,
+        localized_report_note,
+    };
 
     #[test]
     fn overall_status_tracks_the_worst_domain() {
@@ -435,5 +490,37 @@ mod tests {
     fn translates_export_detail_paths() {
         let detail = localized_detail_text("bundle zip saved to C:\\guardian\\bundle.zip");
         assert_eq!(detail, "诊断压缩包已保存到 C:\\guardian\\bundle.zip");
+    }
+
+    #[test]
+    fn translates_managed_codex_trust_notes() {
+        let note = localized_report_note(
+            "Codex project trust is missing for `D:\\Desktop\\Inkforge`; Guardian found 2 expected lookup key(s) absent from `config.toml`.",
+        );
+        assert!(note.contains("D:\\Desktop\\Inkforge"));
+        assert!(note.contains("2"));
+        assert!(note.contains("trust"));
+
+        let confirm = localized_report_note(
+            "Codex confirm mode executed the managed repair chain and persisted audit to C:\\guardian\\audit.json",
+        );
+        assert!(confirm.contains("托管修复链"));
+        assert!(confirm.contains("C:\\guardian\\audit.json"));
+    }
+
+    #[test]
+    fn translates_managed_codex_action_descriptions() {
+        assert_eq!(
+            localized_action_description(
+                "Preview the Codex repair chain, including trust recovery when an untrusted project is identified."
+            ),
+            "先预览 Codex 修复链路；如果识别到未受信任项目，还会一并展示 trust 恢复计划。"
+        );
+        assert_eq!(
+            localized_action_description(
+                "Execute the managed Codex repair chain with backup, verification, and audit."
+            ),
+            "执行托管 Codex 修复链，并完成备份、写后验证与审计。"
+        );
     }
 }

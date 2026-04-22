@@ -30,14 +30,17 @@ Its operating principles are:
 
 ### Codex health and repair
 
-Guardian can inspect a local Codex home, classify common `/resume` failure modes, and run a controlled stale-row repair flow when the known drift pattern is present.
+Guardian can inspect a local Codex home, classify common `/resume` failure modes, detect project trust drift, and run a managed Codex repair flow when the known drift patterns are present.
 
 Key behaviors:
 
 - checks `history.jsonl`, rollout/session files, and the latest `state_*.sqlite`
 - detects `threads.has_user_event` drift
-- runs the trusted repair playbook only when you explicitly pass `--confirm`
+- detects missing trusted project entries in `%USERPROFILE%\.codex\config.toml`
+- runs the managed repair playbook only when you explicitly pass `--confirm`
 - creates a SQLite backup before mutation
+- creates a `config.toml` backup before appending trusted project entries
+- verifies post-write state before declaring success
 - writes a structured repair audit after execution
 
 ### Docker / WSL baseline recovery
@@ -198,7 +201,7 @@ Current release line: **v0.1.0**
 Implemented and wired:
 
 - Codex health checks
-- Codex stale-row repair orchestration
+- Codex managed repair orchestration for stale-row drift and trusted-project drift
 - Docker / WSL checks and guarded repair flows
 - profile diagnostics with guided recovery notes
 - bundle export

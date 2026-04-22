@@ -1,13 +1,17 @@
 use std::{
     ffi::OsString,
+    fs,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
 };
 
+use chrono::Local;
 use guardian_core::{GuardianError, types::ActionPlan};
+use guardian_observers::codex as codex_observer;
 use guardian_windows::{
-    paths::{codex_home_dir, latest_codex_state_db},
+    codex_config::{append_trusted_project_entries, codex_config_path, missing_project_trust_keys},
+    paths::{codex_home_dir, guardian_backup_dir, latest_codex_state_db},
     process::run_command_with_cmd_fallback,
 };
 use rusqlite::Connection;
@@ -36,15 +40,27 @@ impl CodexRepairOutcome {
 
 #[derive(Debug, Clone)]
 pub struct CodexRepairExecution {
-    pub script_path: PathBuf,
-    pub state_db_path: PathBuf,
+    pub script_path: Option<PathBuf>,
+    pub state_db_path: Option<PathBuf>,
     pub backup_path: Option<PathBuf>,
-    pub stale_rows_before: i64,
-    pub stale_rows_after: i64,
+    pub stale_rows_before: Option<i64>,
+    pub stale_rows_after: Option<i64>,
     pub active_version: Option<String>,
     pub stdout_excerpt: Vec<String>,
     pub stderr_excerpt: Vec<String>,
     pub outcome: CodexRepairOutcome,
+    pub trust_repair: Option<CodexTrustRepair>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexTrustRepair {
+    pub target_project_path: PathBuf,
+    pub target_source: String,
+    pub config_path: PathBuf,
+    pub config_backup_path: Option<PathBuf>,
+    pub missing_keys_before: Vec<String>,
+    pub added_keys: Vec<String>,
+    pub created_config: bool,
 }
 
 impl CodexRepairExecution {
@@ -53,25 +69,52 @@ impl CodexRepairExecution {
     }
 
     pub fn outcome_summary(&self) -> String {
+        let trust_added = self
+            .trust_repair
+            .as_ref()
+            .is_some_and(|repair| !repair.added_keys.is_empty());
+        let stale_repaired = matches!(
+            (self.stale_rows_before, self.stale_rows_after),
+            (Some(before), Some(after)) if before > 0 && after == 0
+        );
+
         match self.outcome {
             CodexRepairOutcome::Noop => {
-                "Codex repair confirm completed without changing stale rows.".to_string()
-            }
-            CodexRepairOutcome::Repaired => {
-                "Codex stale-row repair completed and re-check reached zero stale rows.".to_string()
-            }
-            CodexRepairOutcome::Unresolved => {
-                "Codex repair confirm executed, but stale rows still remain after verification."
+                "Codex repair confirm completed without changing stale rows or trust entries."
                     .to_string()
             }
+            CodexRepairOutcome::Repaired => match (stale_repaired, trust_added) {
+                (true, true) => {
+                    "Codex repair confirm cleared stale rows and appended missing trusted project entries."
+                        .to_string()
+                }
+                (true, false) => {
+                    "Codex stale-row repair completed and re-check reached zero stale rows."
+                        .to_string()
+                }
+                (false, true) => {
+                    "Codex trust repair appended missing trusted project entries and verification succeeded."
+                        .to_string()
+                }
+                (false, false) => {
+                    "Codex repair confirm completed without changing stale rows or trust entries."
+                        .to_string()
+                }
+            },
+            CodexRepairOutcome::Unresolved => "Codex repair confirm executed, but stale rows still remain after verification."
+                .to_string(),
         }
     }
 
     pub fn notes(&self) -> Vec<String> {
-        let mut notes = vec![format!(
-            "Trusted script executed: {}",
-            self.script_path.display()
-        )];
+        let mut notes = Vec::new();
+
+        if let Some(script_path) = &self.script_path {
+            notes.push(format!(
+                "Trusted script executed: {}",
+                script_path.display()
+            ));
+        }
 
         if let Some(active_version) = &self.active_version {
             notes.push(format!(
@@ -83,6 +126,28 @@ impl CodexRepairExecution {
                 "SQLite backup created at {}",
                 backup_path.display()
             ));
+        }
+        if let Some(trust_repair) = &self.trust_repair {
+            notes.push(format!(
+                "Trusted project target: {}",
+                trust_repair.target_project_path.display()
+            ));
+            notes.push(format!(
+                "Trusted project source: {}",
+                trust_repair.target_source
+            ));
+            if let Some(config_backup_path) = &trust_repair.config_backup_path {
+                notes.push(format!(
+                    "Codex config backup created at {}",
+                    config_backup_path.display()
+                ));
+            }
+            if !trust_repair.added_keys.is_empty() {
+                notes.push(format!(
+                    "Trusted project keys appended: {}",
+                    trust_repair.added_keys.join(" | ")
+                ));
+            }
         }
         if !self.stdout_excerpt.is_empty() {
             notes.push(format!(
@@ -101,72 +166,99 @@ impl CodexRepairExecution {
     }
 }
 
-pub fn planned_actions() -> Vec<ActionPlan> {
+pub fn planned_actions(project_path: Option<&Path>) -> Vec<ActionPlan> {
+    let dry_run = command_with_project_path("guardian repair codex --dry-run", project_path);
+    let confirm = command_with_project_path("guardian repair codex --confirm", project_path);
     vec![
         ActionPlan::new(
-            "guardian repair codex --dry-run".to_string(),
-            "Preview the Codex repair chain without mutating the environment.".to_string(),
+            dry_run,
+            "Preview the Codex repair chain, including trust recovery when an untrusted project is identified."
+                .to_string(),
             false,
         ),
         ActionPlan::new(
-            "guardian repair codex --confirm".to_string(),
-            "Execute the trusted Codex stale-row repair chain with backup, verification, and audit."
+            confirm,
+            "Execute the managed Codex repair chain with backup, verification, and audit."
                 .to_string(),
             true,
         ),
     ]
 }
 
-pub fn execute_confirmed() -> Result<CodexRepairExecution, GuardianError> {
-    let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
-    let script_path = repair_script_path(&codex_home);
-    if !script_path.exists() {
-        return Err(GuardianError::invalid_state(format!(
-            "trusted repair script is missing: {}",
-            script_path.display()
-        )));
-    }
+pub fn execute_confirmed(
+    project_path: Option<&Path>,
+) -> Result<CodexRepairExecution, GuardianError> {
+    let observer_report = codex_observer::observe_with_target(project_path)?;
+    let repair_stale_rows = domain_has_failure_class(&observer_report, "C2");
+    let trust_target = trust_target_from_report(&observer_report);
 
-    let state_db_path = latest_codex_state_db(&codex_home)
-        .map_err(GuardianError::Io)?
-        .ok_or_else(|| {
-            GuardianError::invalid_state(format!(
-                "expected a `state_*.sqlite` database under `{}` but none was found",
-                codex_home.display()
-            ))
-        })?;
-
-    let stale_rows_before = inspect_stale_rows(&state_db_path)?;
-    let target_version = current_codex_version();
-    let process_output = run_repair_script(
-        &script_path,
-        &codex_home,
-        &state_db_path,
-        target_version.as_deref(),
-    )?;
-    let stale_rows_after = inspect_stale_rows(&state_db_path)?;
-    let active_version = active_version_from_output(&process_output.stdout);
-    let backup_path = backup_path_from_output(&process_output.stdout);
-
-    let outcome = if stale_rows_before == 0 && stale_rows_after == 0 {
-        CodexRepairOutcome::Noop
-    } else if stale_rows_before > 0 && stale_rows_after == 0 {
-        CodexRepairOutcome::Repaired
-    } else {
-        CodexRepairOutcome::Unresolved
+    let mut execution = CodexRepairExecution {
+        script_path: None,
+        state_db_path: None,
+        backup_path: None,
+        stale_rows_before: None,
+        stale_rows_after: None,
+        active_version: None,
+        stdout_excerpt: Vec::new(),
+        stderr_excerpt: Vec::new(),
+        outcome: CodexRepairOutcome::Noop,
+        trust_repair: None,
     };
 
-    Ok(CodexRepairExecution {
-        script_path,
-        state_db_path,
-        backup_path,
-        stale_rows_before,
-        stale_rows_after,
-        active_version,
-        stdout_excerpt: excerpt_lines(&process_output.stdout),
-        stderr_excerpt: excerpt_lines(&process_output.stderr),
-        outcome,
-    })
+    if repair_stale_rows {
+        let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
+        let script_path = repair_script_path(&codex_home);
+        if !script_path.exists() {
+            return Err(GuardianError::invalid_state(format!(
+                "trusted repair script is missing: {}",
+                script_path.display()
+            )));
+        }
+
+        let state_db_path = latest_codex_state_db(&codex_home)
+            .map_err(GuardianError::Io)?
+            .ok_or_else(|| {
+                GuardianError::invalid_state(format!(
+                    "expected a `state_*.sqlite` database under `{}` but none was found",
+                    codex_home.display()
+                ))
+            })?;
+
+        let stale_rows_before = inspect_stale_rows(&state_db_path)?;
+        let target_version = current_codex_version();
+        let process_output = run_repair_script(
+            &script_path,
+            &codex_home,
+            &state_db_path,
+            target_version.as_deref(),
+        )?;
+        let stale_rows_after = inspect_stale_rows(&state_db_path)?;
+
+        execution.script_path = Some(script_path);
+        execution.state_db_path = Some(state_db_path);
+        execution.backup_path = backup_path_from_output(&process_output.stdout);
+        execution.stale_rows_before = Some(stale_rows_before);
+        execution.stale_rows_after = Some(stale_rows_after);
+        execution.active_version = active_version_from_output(&process_output.stdout);
+        execution.stdout_excerpt = excerpt_lines(&process_output.stdout);
+        execution.stderr_excerpt = excerpt_lines(&process_output.stderr);
+
+        if stale_rows_after > 0 {
+            execution.outcome = CodexRepairOutcome::Unresolved;
+        } else if stale_rows_before > 0 {
+            execution.outcome = CodexRepairOutcome::Repaired;
+        }
+    }
+
+    if let Some(target) = trust_target {
+        let trust_repair = apply_project_trust_repair(&target)?;
+        if !trust_repair.added_keys.is_empty() {
+            execution.outcome = CodexRepairOutcome::Repaired;
+        }
+        execution.trust_repair = Some(trust_repair);
+    }
+
+    Ok(execution)
 }
 
 fn repair_script_path(codex_home: &Path) -> PathBuf {
@@ -219,6 +311,126 @@ fn current_codex_version() -> Option<String> {
         return None;
     }
     parse_semver_fragment(&output.stdout)
+}
+
+fn command_with_project_path(base: &str, project_path: Option<&Path>) -> String {
+    project_path.map_or_else(
+        || base.to_string(),
+        |path| format!("{base} --project-path {}", path.display()),
+    )
+}
+
+fn domain_has_failure_class(report: &guardian_core::types::DomainReport, class: &str) -> bool {
+    domain_evidence_value(report, "failure_classes")
+        .map(|value| value.split(',').any(|item| item.trim() == class))
+        .unwrap_or(false)
+}
+
+fn domain_evidence_value<'a>(
+    report: &'a guardian_core::types::DomainReport,
+    key: &str,
+) -> Option<&'a str> {
+    report
+        .evidence
+        .iter()
+        .find(|item| item.key == key)
+        .map(|item| item.value.as_str())
+}
+
+#[derive(Debug, Clone)]
+struct TrustRepairTarget {
+    path: PathBuf,
+    source: String,
+}
+
+fn trust_target_from_report(
+    report: &guardian_core::types::DomainReport,
+) -> Option<TrustRepairTarget> {
+    let path = domain_evidence_value(report, "trust_target_path")?;
+    let source = domain_evidence_value(report, "trust_target_source")
+        .unwrap_or("unknown")
+        .to_string();
+    let missing_keys = domain_evidence_value(report, "trust_missing_lookup_keys").unwrap_or("");
+    if missing_keys.trim().is_empty() {
+        return None;
+    }
+
+    Some(TrustRepairTarget {
+        path: PathBuf::from(path),
+        source,
+    })
+}
+
+fn apply_project_trust_repair(
+    target: &TrustRepairTarget,
+) -> Result<CodexTrustRepair, GuardianError> {
+    let config_path = codex_config_path().map_err(GuardianError::Io)?;
+    let created_config = !config_path.exists();
+    let existing_text = if created_config {
+        String::new()
+    } else {
+        fs::read_to_string(&config_path)?
+    };
+    let missing_keys_before = missing_project_trust_keys(&existing_text, &target.path)
+        .map_err(|error| GuardianError::invalid_state(format!("invalid codex config: {error}")))?;
+
+    if missing_keys_before.is_empty() {
+        return Ok(CodexTrustRepair {
+            target_project_path: target.path.clone(),
+            target_source: target.source.clone(),
+            config_path,
+            config_backup_path: None,
+            missing_keys_before,
+            added_keys: Vec::new(),
+            created_config,
+        });
+    }
+
+    let config_backup_path = backup_codex_config(&config_path, &existing_text)?;
+    let rendered = append_trusted_project_entries(&existing_text, &missing_keys_before);
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&config_path, rendered)?;
+
+    let verified_text = fs::read_to_string(&config_path)?;
+    let missing_after = missing_project_trust_keys(&verified_text, &target.path)
+        .map_err(|error| GuardianError::invalid_state(format!("invalid codex config: {error}")))?;
+    if !missing_after.is_empty() {
+        return Err(GuardianError::invalid_state(format!(
+            "Codex trust verification failed for `{}`; {} expected lookup key(s) still missing after write",
+            target.path.display(),
+            missing_after.len()
+        )));
+    }
+
+    Ok(CodexTrustRepair {
+        target_project_path: target.path.clone(),
+        target_source: target.source.clone(),
+        config_path,
+        config_backup_path,
+        missing_keys_before: missing_keys_before.clone(),
+        added_keys: missing_keys_before,
+        created_config,
+    })
+}
+
+fn backup_codex_config(
+    config_path: &Path,
+    existing_text: &str,
+) -> Result<Option<PathBuf>, GuardianError> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let backup_dir = guardian_backup_dir().map_err(GuardianError::Io)?;
+    fs::create_dir_all(&backup_dir)?;
+    let backup_path = backup_dir.join(format!(
+        "codex-config-{}.toml.bak",
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    fs::write(&backup_path, existing_text)?;
+    Ok(Some(backup_path))
 }
 
 fn parse_semver_fragment(text: &str) -> Option<String> {
@@ -328,8 +540,10 @@ struct ProcessOutput {
 mod tests {
     use super::{
         ACTIVE_VERSION_PREFIX, BACKUP_PREFIX, REPAIR_PREFIX, active_version_from_output,
-        backup_path_from_output, normalize_repair_prefix, parse_semver_fragment,
+        backup_path_from_output, command_with_project_path, normalize_repair_prefix,
+        parse_semver_fragment,
     };
+    use std::path::Path;
 
     #[test]
     fn parses_backup_path_from_script_output() {
@@ -359,5 +573,16 @@ mod tests {
     fn parses_semver_fragment_from_codex_version_output() {
         let version = parse_semver_fragment("codex-cli 0.121.0").expect("expected semver");
         assert_eq!(version, "0.121.0");
+    }
+
+    #[test]
+    fn renders_command_with_project_path_override() {
+        assert_eq!(
+            command_with_project_path(
+                "guardian repair codex --confirm",
+                Some(Path::new(r"D:\Desktop\Inkforge")),
+            ),
+            r"guardian repair codex --confirm --project-path D:\Desktop\Inkforge"
+        );
     }
 }

@@ -46,8 +46,14 @@ pub struct RepairArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum RepairTarget {
-    Codex,
+    Codex(CodexRepairArgs),
     Docker,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct CodexRepairArgs {
+    #[arg(long, value_name = "PATH")]
+    pub project_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -98,7 +104,7 @@ pub struct GuiArgs {}
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, DiagnoseTarget, ExportTarget, RepairTarget};
+    use super::{Cli, CodexRepairArgs, Command, DiagnoseTarget, ExportTarget, RepairTarget};
 
     #[test]
     fn parses_check_with_global_json_flag() {
@@ -114,9 +120,33 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Repair(super::RepairArgs {
-                target: RepairTarget::Codex
+                target: RepairTarget::Codex(CodexRepairArgs { project_path: None })
             })
         ));
+    }
+
+    #[test]
+    fn parses_repair_codex_with_project_path_override() {
+        let cli = Cli::parse_from([
+            "guardian",
+            "repair",
+            "codex",
+            "--project-path",
+            "D:\\Desktop\\Inkforge",
+            "--confirm",
+        ]);
+        assert!(cli.global.confirm);
+        match cli.command {
+            Command::Repair(super::RepairArgs {
+                target: RepairTarget::Codex(args),
+            }) => {
+                assert_eq!(
+                    args.project_path.as_deref(),
+                    Some(std::path::Path::new("D:\\Desktop\\Inkforge"))
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
