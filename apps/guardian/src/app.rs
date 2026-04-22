@@ -195,6 +195,58 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                         ));
                 }
             }
+            if let Some(slow_path_repair) = &execution.slow_path_repair {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_slow_path_launcher_path",
+                        slow_path_repair.launcher_path.display().to_string(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_slow_path_hotfix_binary_path",
+                        slow_path_repair.hotfix_binary_path.display().to_string(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_slow_path_hotfix_source_path",
+                        slow_path_repair.hotfix_source_path.display().to_string(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_slow_path_launcher_updated",
+                        slow_path_repair.launcher_updated.to_string(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_slow_path_hotfix_binary_updated",
+                        slow_path_repair.hotfix_binary_updated.to_string(),
+                    ));
+                if let Some(launcher_backup_path) = &slow_path_repair.launcher_backup_path {
+                    report
+                        .domains
+                        .codex
+                        .evidence
+                        .push(guardian_core::types::EvidenceItem::new(
+                            "repair_slow_path_launcher_backup_path",
+                            launcher_backup_path.display().to_string(),
+                        ));
+                }
+            }
             report.domains.codex.notes.extend(execution.notes());
             report.notes.push(format!(
                 "Codex confirm mode executed the managed repair chain and persisted audit to {}",
@@ -675,6 +727,31 @@ fn persist_codex_repair_audit(
             .as_ref()
             .map(|repair| repair.added_keys.clone())
             .unwrap_or_default(),
+        slow_path_launcher_path: execution
+            .slow_path_repair
+            .as_ref()
+            .map(|repair| repair.launcher_path.display().to_string()),
+        slow_path_launcher_backup_path: execution
+            .slow_path_repair
+            .as_ref()
+            .and_then(|repair| repair.launcher_backup_path.as_ref())
+            .map(|path| path.display().to_string()),
+        slow_path_hotfix_binary_path: execution
+            .slow_path_repair
+            .as_ref()
+            .map(|repair| repair.hotfix_binary_path.display().to_string()),
+        slow_path_hotfix_source_path: execution
+            .slow_path_repair
+            .as_ref()
+            .map(|repair| repair.hotfix_source_path.display().to_string()),
+        slow_path_launcher_updated: execution
+            .slow_path_repair
+            .as_ref()
+            .is_some_and(|repair| repair.launcher_updated),
+        slow_path_hotfix_binary_updated: execution
+            .slow_path_repair
+            .as_ref()
+            .is_some_and(|repair| repair.hotfix_binary_updated),
     };
 
     fs::write(&audit_path, serde_json::to_string_pretty(&audit_record)?)?;
