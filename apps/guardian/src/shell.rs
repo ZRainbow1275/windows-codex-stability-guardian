@@ -324,6 +324,24 @@ pub(crate) fn localized_report_note(note: &str) -> String {
     if let Some(path) = note.strip_prefix("SQLite backup created at ") {
         return format!("SQLite 备份已写入：{path}");
     }
+    if let Some(path) = note.strip_prefix("Codex slow-path launcher target: ") {
+        return format!("Codex slow-path launcher 目标：{path}");
+    }
+    if let Some(path) = note.strip_prefix("Codex slow-path hotfix source: ") {
+        return format!("Codex slow-path hotfix 来源：{path}");
+    }
+    if let Some(path) = note.strip_prefix("Codex slow-path hotfix binary path: ") {
+        return format!("Codex slow-path hotfix 落点：{path}");
+    }
+    if let Some(path) = note.strip_prefix("Codex launcher backup created at ") {
+        return format!("Codex launcher 备份已写入：{path}");
+    }
+    if let Some(value) = note.strip_prefix("Codex slow-path launcher updated: ") {
+        return format!("Codex slow-path launcher 是否已更新：{value}");
+    }
+    if let Some(value) = note.strip_prefix("Codex slow-path hotfix binary updated: ") {
+        return format!("Codex slow-path hotfix 二进制是否已更新：{value}");
+    }
     if let Some(excerpt) = note.strip_prefix("Script stdout excerpt: ") {
         return format!("脚本 stdout 摘要：{excerpt}");
     }
@@ -368,12 +386,15 @@ pub(crate) fn localized_report_note(note: &str) -> String {
 
 pub(crate) fn localized_action_description(description: &str) -> String {
     match description {
-        "Preview the Codex repair chain, including trust recovery when an untrusted project is identified." => {
-            "先预览 Codex 修复链路；如果识别到未受信任项目，还会一并展示 trust 恢复计划。"
+        "Preview the Codex repair chain, including trust recovery and slow-path launcher staging when those drifts are identified." =>
+        {
+            "先预览 Codex 修复链路；如果识别到 trust drift 或 slow-path 漂移，也会一并展示对应恢复计划。"
                 .to_string()
         }
-        "Execute the managed Codex repair chain with backup, verification, and audit." => {
-            "执行托管 Codex 修复链，并完成备份、写后验证与审计。".to_string()
+        "Execute the managed Codex repair chain with backup, verification, audit, and controlled slow-path launcher hotfix staging." =>
+        {
+            "执行托管 Codex 修复链，并完成备份、写后验证、审计，以及受控 slow-path launcher hotfix 布置。"
+                .to_string()
         }
         "Preview the Docker and WSL recovery chain." => {
             "先预览 Docker / WSL 恢复链路。".to_string()
@@ -405,6 +426,44 @@ fn localized_codex_summary(summary: &str) -> String {
     if summary == "Codex home directory is missing, so no local Codex evidence could be collected."
     {
         return "缺少 Codex 主目录，因此无法采集本机 Codex 证据。".to_string();
+    }
+    if summary
+        == "Codex repair confirm completed without changing stale rows, trust entries, or slow-path launcher state."
+    {
+        return "Codex 确认修复已执行，但本次没有改动 stale rows、trust 条目或 slow-path launcher 状态。"
+            .to_string();
+    }
+    if let Some(details) = summary.strip_prefix("Codex repair confirm ")
+        && let Some(details) =
+            details.strip_suffix(", but stale rows still remain after verification.")
+    {
+        let translated = details
+            .replace("cleared stale rows", "清除了 stale rows")
+            .replace(
+                "appended missing trusted project entries",
+                "补齐了缺失的 trusted project 条目",
+            )
+            .replace(
+                "staged the Codex slow-path launcher hotfix",
+                "布置了 Codex slow-path launcher hotfix",
+            );
+        return format!("Codex 确认修复已执行：{translated}，但写后复核仍发现 stale rows 未清零。");
+    }
+    if let Some(details) = summary
+        .strip_prefix("Codex repair confirm ")
+        .and_then(|value| value.strip_suffix("."))
+    {
+        let translated = details
+            .replace("cleared stale rows", "清除了 stale rows")
+            .replace(
+                "appended missing trusted project entries",
+                "补齐了缺失的 trusted project 条目",
+            )
+            .replace(
+                "staged the Codex slow-path launcher hotfix",
+                "布置了 Codex slow-path launcher hotfix",
+            );
+        return format!("Codex 确认修复已执行：{translated}。");
     }
     if let Some(remainder) = summary.strip_prefix("Collected live Codex evidence from `")
         && let Some((home, rest)) = remainder.split_once("` with ")
@@ -512,15 +571,15 @@ mod tests {
     fn translates_managed_codex_action_descriptions() {
         assert_eq!(
             localized_action_description(
-                "Preview the Codex repair chain, including trust recovery when an untrusted project is identified."
+                "Preview the Codex repair chain, including trust recovery and slow-path launcher staging when those drifts are identified."
             ),
-            "先预览 Codex 修复链路；如果识别到未受信任项目，还会一并展示 trust 恢复计划。"
+            "先预览 Codex 修复链路；如果识别到 trust drift 或 slow-path 漂移，也会一并展示对应恢复计划。"
         );
         assert_eq!(
             localized_action_description(
-                "Execute the managed Codex repair chain with backup, verification, and audit."
+                "Execute the managed Codex repair chain with backup, verification, audit, and controlled slow-path launcher hotfix staging."
             ),
-            "执行托管 Codex 修复链，并完成备份、写后验证与审计。"
+            "执行托管 Codex 修复链，并完成备份、写后验证、审计，以及受控 slow-path launcher hotfix 布置。"
         );
     }
 }

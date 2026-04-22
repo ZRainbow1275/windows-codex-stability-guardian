@@ -36,10 +36,12 @@ Key behaviors:
 
 - checks `history.jsonl`, rollout/session files, and the latest `state_*.sqlite`
 - detects `threads.has_user_event` drift
+- detects `/resume` slow-path drift from `codex-tui.log` when recent runs stall on `Loading sessions...`
 - detects missing trusted project entries in `%USERPROFILE%\.codex\config.toml`
 - runs the managed repair playbook only when you explicitly pass `--confirm`
 - creates a SQLite backup before mutation
 - creates a `config.toml` backup before appending trusted project entries
+- creates a launcher backup before staging a controlled `vendor-hotfix` binary and patching the Codex launcher for validated `C4` slow-path cases
 - verifies post-write state before declaring success
 - writes a structured repair audit after execution
 
@@ -149,6 +151,7 @@ Guardian is intentionally conservative:
 - `guardian.exe check` is always read-only
 - write actions are gated behind `--confirm`
 - Codex repairs back up the active SQLite state database first
+- Codex slow-path launcher staging is only allowed inside `guardian repair codex --confirm` after Guardian has classified `C4` and found a verified local hotfix binary
 - profile diagnostics never auto-edit `ProfileList` or terminate security software
 - runtime restart flows for Docker / WSL are guarded by live machine state
 

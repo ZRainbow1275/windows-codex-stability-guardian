@@ -31,6 +31,12 @@ pub struct RepairAuditRecord {
     pub trust_config_backup_path: Option<String>,
     pub trust_missing_keys_before: Vec<String>,
     pub trust_added_keys: Vec<String>,
+    pub slow_path_launcher_path: Option<String>,
+    pub slow_path_launcher_backup_path: Option<String>,
+    pub slow_path_hotfix_binary_path: Option<String>,
+    pub slow_path_hotfix_source_path: Option<String>,
+    pub slow_path_launcher_updated: bool,
+    pub slow_path_hotfix_binary_updated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
