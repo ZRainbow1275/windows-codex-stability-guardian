@@ -18,13 +18,19 @@ pub struct RepairAuditRecord {
     pub timestamp: String,
     pub action: String,
     pub outcome: String,
-    pub state_db_path: String,
-    pub stale_rows_before: i64,
-    pub stale_rows_after: i64,
+    pub state_db_path: Option<String>,
+    pub stale_rows_before: Option<i64>,
+    pub stale_rows_after: Option<i64>,
     pub active_version: Option<String>,
     pub backup_path: Option<String>,
     pub stdout_excerpt: Vec<String>,
     pub stderr_excerpt: Vec<String>,
+    pub trust_target_path: Option<String>,
+    pub trust_target_source: Option<String>,
+    pub trust_config_path: Option<String>,
+    pub trust_config_backup_path: Option<String>,
+    pub trust_missing_keys_before: Vec<String>,
+    pub trust_added_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

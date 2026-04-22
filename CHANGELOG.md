@@ -19,9 +19,11 @@ The format is based on Keep a Changelog.
   - `export bundle`
   - `gui`
   - `tray`
-- Codex stale-row repair orchestration with:
+- Codex managed repair orchestration with:
   - pre-flight health inspection
   - backup-first SQLite repair
+  - project trust drift detection for `.codex/config.toml`
+  - confirm-gated trusted project entry append with post-write verification
   - structured confirm-mode audit output
 - Docker / WSL repair flows with guarded runtime restart behavior.
 - Profile diagnosis output with guided recovery notes.

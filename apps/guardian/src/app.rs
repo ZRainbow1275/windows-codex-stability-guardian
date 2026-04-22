@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use chrono::Local;
 use guardian_core::{
@@ -40,16 +43,14 @@ fn handle_check(global: &GlobalArgs, _args: CheckArgs) -> Result<i32, GuardianEr
 }
 
 fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianError> {
-    let base_report = build_health_report()?;
-
     match args.target {
-        RepairTarget::Codex => {
-            let mut report = focused_codex_report(&base_report);
-            report.actions = codex_repair::planned_actions();
+        RepairTarget::Codex(args) => {
+            let mut report = build_focused_codex_report(args.project_path.as_deref())?;
+            report.actions = codex_repair::planned_actions(args.project_path.as_deref());
 
             if !global.dry_run && !global.confirm {
                 report.notes.push(
-                    "Codex repair is gated behind `--confirm`; use `--dry-run` to preview the live repair chain or `--confirm` to execute it with backup and audit."
+                    "Codex repair is gated behind `--confirm`; use `--dry-run` to preview the managed repair chain or `--confirm` to execute it with backup, verification, and audit."
                         .to_string(),
                 );
                 emit_report(global, &report)?;
@@ -58,7 +59,8 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
 
             if global.dry_run {
                 report.notes.push(
-                    "Dry-run only: the trusted Codex repair script was not executed.".to_string(),
+                    "Dry-run only: the managed Codex repair chain did not modify the environment."
+                        .to_string(),
                 );
                 emit_report(global, &report)?;
                 return Ok(if report.domains.codex.status == StatusLevel::Ok {
@@ -68,34 +70,57 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                 });
             }
 
-            let execution = codex_repair::execute_confirmed()?;
+            let execution = codex_repair::execute_confirmed(args.project_path.as_deref())?;
             let audit_path = persist_codex_repair_audit(&execution)?;
-            let refreshed_report = build_health_report()?;
-            report = focused_codex_report(&refreshed_report);
-            report.actions = codex_repair::planned_actions();
+            report = build_focused_codex_report(args.project_path.as_deref())?;
+            report.actions = codex_repair::planned_actions(args.project_path.as_deref());
             report.domains.codex.summary = execution.outcome_summary();
-            report.domains.codex.evidence.extend([
-                guardian_core::types::EvidenceItem::new(
+            report
+                .domains
+                .codex
+                .evidence
+                .push(guardian_core::types::EvidenceItem::new(
                     "repair_outcome",
                     execution.outcome.as_str().to_string(),
-                ),
-                guardian_core::types::EvidenceItem::new(
-                    "repair_state_db",
-                    execution.state_db_path.display().to_string(),
-                ),
-                guardian_core::types::EvidenceItem::new(
-                    "repair_stale_before",
-                    execution.stale_rows_before.to_string(),
-                ),
-                guardian_core::types::EvidenceItem::new(
-                    "repair_stale_after",
-                    execution.stale_rows_after.to_string(),
-                ),
-                guardian_core::types::EvidenceItem::new(
+                ));
+            if let Some(state_db_path) = &execution.state_db_path {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_state_db",
+                        state_db_path.display().to_string(),
+                    ));
+            }
+            if let Some(stale_rows_before) = execution.stale_rows_before {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_stale_before",
+                        stale_rows_before.to_string(),
+                    ));
+            }
+            if let Some(stale_rows_after) = execution.stale_rows_after {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_stale_after",
+                        stale_rows_after.to_string(),
+                    ));
+            }
+            report
+                .domains
+                .codex
+                .evidence
+                .push(guardian_core::types::EvidenceItem::new(
                     "repair_audit_path",
                     audit_path.display().to_string(),
-                ),
-            ]);
+                ));
             if let Some(backup_path) = &execution.backup_path {
                 report
                     .domains
@@ -106,9 +131,73 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                         backup_path.display().to_string(),
                     ));
             }
+            if let Some(trust_repair) = &execution.trust_repair {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_trust_target_path",
+                        trust_repair.target_project_path.display().to_string(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_trust_target_source",
+                        trust_repair.target_source.clone(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_trust_config_path",
+                        trust_repair.config_path.display().to_string(),
+                    ));
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_trust_created_config",
+                        trust_repair.created_config.to_string(),
+                    ));
+                if let Some(config_backup_path) = &trust_repair.config_backup_path {
+                    report
+                        .domains
+                        .codex
+                        .evidence
+                        .push(guardian_core::types::EvidenceItem::new(
+                            "repair_trust_config_backup_path",
+                            config_backup_path.display().to_string(),
+                        ));
+                }
+                if !trust_repair.missing_keys_before.is_empty() {
+                    report
+                        .domains
+                        .codex
+                        .evidence
+                        .push(guardian_core::types::EvidenceItem::new(
+                            "repair_trust_missing_keys_before",
+                            trust_repair.missing_keys_before.join(" | "),
+                        ));
+                }
+                if !trust_repair.added_keys.is_empty() {
+                    report
+                        .domains
+                        .codex
+                        .evidence
+                        .push(guardian_core::types::EvidenceItem::new(
+                            "repair_trust_added_keys",
+                            trust_repair.added_keys.join(" | "),
+                        ));
+                }
+            }
             report.domains.codex.notes.extend(execution.notes());
             report.notes.push(format!(
-                "Codex confirm mode executed the trusted stale-row repair chain and persisted audit to {}",
+                "Codex confirm mode executed the managed repair chain and persisted audit to {}",
                 audit_path.display()
             ));
 
@@ -124,6 +213,7 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
             )
         }
         RepairTarget::Docker => {
+            let base_report = build_health_report()?;
             let mut report = focused_docker_report(&base_report);
             report.actions = docker_repair::planned_actions();
 
@@ -346,13 +436,15 @@ fn handle_diagnose(global: &GlobalArgs, args: DiagnoseArgs) -> Result<i32, Guard
     }
 }
 
-fn focused_codex_report(report: &HealthReport) -> HealthReport {
-    HealthReport::new(
+fn build_focused_codex_report(project_path: Option<&Path>) -> Result<HealthReport, GuardianError> {
+    Ok(HealthReport::new(
         timestamp(),
-        DomainReports::single_codex(report.domains.codex.clone()),
+        DomainReports::single_codex(codex::observe_with_target(project_path)?),
         Vec::new(),
-        report.notes.clone(),
-    )
+        vec![
+            "Codex confirm repair is live, trust drift detection is live, Docker D3 managed repair is live, guarded Docker/WSL runtime restart recovery for D1/D2/D4 is live when the machine can prove zero running containers, and profile event collection is live in read-only mode.".to_string(),
+        ],
+    ))
 }
 
 fn focused_docker_report(report: &HealthReport) -> HealthReport {
@@ -500,11 +592,7 @@ fn build_health_report() -> Result<HealthReport, GuardianError> {
 
     let mut actions = Vec::new();
     if codex_report.status != StatusLevel::Ok {
-        actions.push(ActionPlan::new(
-            "guardian repair codex --dry-run".to_string(),
-            "Preview the low-risk Codex repair chain.".to_string(),
-            false,
-        ));
+        actions.extend(codex_repair::planned_actions(None).into_iter().take(1));
     }
     if docker_report.status != StatusLevel::Ok {
         actions.push(ActionPlan::new(
@@ -530,7 +618,7 @@ fn build_health_report() -> Result<HealthReport, GuardianError> {
         },
         actions,
         vec![
-            "Codex confirm repair is live, Docker D3 managed repair is live, guarded Docker/WSL runtime restart recovery for D1/D2/D4 is live when the machine can prove zero running containers, and profile event collection is live in read-only mode.".to_string(),
+            "Codex confirm repair is live, trust drift detection is live, Docker D3 managed repair is live, guarded Docker/WSL runtime restart recovery for D1/D2/D4 is live when the machine can prove zero running containers, and profile event collection is live in read-only mode.".to_string(),
         ],
     ))
 }
@@ -547,7 +635,10 @@ fn persist_codex_repair_audit(
         timestamp: Local::now().to_rfc3339(),
         action: "guardian repair codex --confirm".to_string(),
         outcome: execution.outcome.as_str().to_string(),
-        state_db_path: execution.state_db_path.display().to_string(),
+        state_db_path: execution
+            .state_db_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         stale_rows_before: execution.stale_rows_before,
         stale_rows_after: execution.stale_rows_after,
         active_version: execution.active_version.clone(),
@@ -557,6 +648,33 @@ fn persist_codex_repair_audit(
             .map(|path| path.display().to_string()),
         stdout_excerpt: execution.stdout_excerpt.clone(),
         stderr_excerpt: execution.stderr_excerpt.clone(),
+        trust_target_path: execution
+            .trust_repair
+            .as_ref()
+            .map(|repair| repair.target_project_path.display().to_string()),
+        trust_target_source: execution
+            .trust_repair
+            .as_ref()
+            .map(|repair| repair.target_source.clone()),
+        trust_config_path: execution
+            .trust_repair
+            .as_ref()
+            .map(|repair| repair.config_path.display().to_string()),
+        trust_config_backup_path: execution
+            .trust_repair
+            .as_ref()
+            .and_then(|repair| repair.config_backup_path.as_ref())
+            .map(|path| path.display().to_string()),
+        trust_missing_keys_before: execution
+            .trust_repair
+            .as_ref()
+            .map(|repair| repair.missing_keys_before.clone())
+            .unwrap_or_default(),
+        trust_added_keys: execution
+            .trust_repair
+            .as_ref()
+            .map(|repair| repair.added_keys.clone())
+            .unwrap_or_default(),
     };
 
     fs::write(&audit_path, serde_json::to_string_pretty(&audit_record)?)?;

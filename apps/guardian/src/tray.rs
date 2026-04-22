@@ -947,7 +947,8 @@ fn confirm_tray_action(action: TrayAction) -> bool {
         TrayAction::RepairCodexConfirm => concat!(
             "即将执行真实的 Codex 修复链。\n",
             "- 会触发 `guardian repair codex --confirm --json`\n",
-            "- 可能修改 state 数据库并写入审计文件\n",
+            "- 可能修改 state 数据库，或为目标项目补齐 `%USERPROFILE%\\.codex\\config.toml` 中的 trusted 条目\n",
+            "- 会写入审计文件，并在写后做验证\n",
             "- 建议先阅读主窗口中的状态摘要与风险说明\n\n",
             "确认继续执行吗？"
         ),
