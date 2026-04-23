@@ -247,6 +247,16 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                         ));
                 }
             }
+            if let Some(slow_path_error) = &execution.slow_path_error {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_slow_path_error",
+                        slow_path_error.clone(),
+                    ));
+            }
             report.domains.codex.notes.extend(execution.notes());
             report.notes.push(format!(
                 "Codex confirm mode executed the managed repair chain and persisted audit to {}",
@@ -752,6 +762,7 @@ fn persist_codex_repair_audit(
             .slow_path_repair
             .as_ref()
             .is_some_and(|repair| repair.hotfix_binary_updated),
+        slow_path_error: execution.slow_path_error.clone(),
     };
 
     fs::write(&audit_path, serde_json::to_string_pretty(&audit_record)?)?;

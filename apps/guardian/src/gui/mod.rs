@@ -2890,6 +2890,7 @@ fn localized_evidence_label(domain: &str, key: &str) -> String {
         ("codex", "repair_slow_path_hotfix_source_path") => Some("slow-path hotfix 来源"),
         ("codex", "repair_slow_path_launcher_updated") => Some("launcher 已更新"),
         ("codex", "repair_slow_path_hotfix_binary_updated") => Some("hotfix 二进制已更新"),
+        ("codex", "repair_slow_path_error") => Some("slow-path 修复错误"),
         ("docker_wsl", "docker_version") => Some("Docker 版本"),
         ("docker_wsl", "docker_info") => Some("Docker 运行信息"),
         ("docker_wsl", "wsl_list") => Some("WSL 列表"),

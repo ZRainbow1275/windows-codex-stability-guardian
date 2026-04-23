@@ -9,22 +9,31 @@ Guardian is a conservative workstation operations tool built for a very specific
 
 ## Why this project exists
 
-Some workstation failures look like data loss, broken installs, or "just restart everything" incidents when they are actually caused by:
+Guardian was created to solve a concrete problem: developers on Windows workstations lose hours every week to a small set of recurring local failures that look scarier than they are, and the usual response — reinstall, reboot, re-clone — either hides the underlying drift or destroys work that could have been saved.
 
-- local state drift
-- stale SQLite rows
-- Docker / WSL baseline drift
-- user-profile locks or temporary-profile risk
+Typical symptoms Guardian was built for:
 
-Guardian is designed to make those problems observable first and repairable second.
+- Codex CLI `/resume` stops loading recent sessions or stalls on `Loading sessions…`
+- Codex rejects an otherwise legitimate project path because its trusted-project list has drifted
+- Docker Desktop or WSL2 refuses to start cleanly after a Windows update, or `.wslconfig` no longer matches the baseline the team agreed on
+- Windows logs the user into a temporary profile, or `ProfileList` shows registry-lock evidence that a naive fix could make worse
 
-Its operating principles are:
+What these incidents have in common:
 
-- **Observe before repair**
-- **Backup before write**
-- **Explicit confirmation before mutation**
-- **Windows-native, low-overhead operation**
-- **No dependence on remote services**
+- The root cause is local state drift, not code
+- The safe fix is narrow and well-understood, but risky to run by hand
+- Running the wrong "fix" (an ad-hoc registry edit, a full Codex reinstall, a force-kill of `vmmem`) can turn a 30-second drift into a day of recovery
+
+Guardian's job is to make that class of problem **observable first** and **repairable second**, and to refuse to touch anything it cannot classify. It is the tool a careful operator would build for themselves after being burned once too often by "just reinstall it" advice.
+
+Operating principles:
+
+- **Observe before repair** — every repair starts from live machine evidence, not from assumptions
+- **Backup before write** — SQLite state, `config.toml`, and Codex launcher are backed up before any mutation
+- **Explicit confirmation before mutation** — `--confirm` is required; no background auto-fix
+- **Bounded repair surface** — Guardian only repairs failure classes it can classify from evidence; anything else is reported, not touched
+- **Windows-native, low-overhead operation** — runs on the workstation, uses Windows Event Log, registry reads, and PowerShell where appropriate
+- **No dependence on remote services** — no telemetry, no cloud, no account required
 
 ## What Guardian does
 
@@ -203,12 +212,13 @@ Current release line: **v0.1.0**
 
 Implemented and wired:
 
-- Codex health checks
-- Codex managed repair orchestration for stale-row drift and trusted-project drift
-- Docker / WSL checks and guarded repair flows
+- Codex health checks (history, sessions, state SQLite, TUI log, trusted-project config)
+- Codex managed repair orchestration for stale-row drift (`C2`), trusted-project drift (`C6`), and `/resume` slow-path drift (`C4`) with guarded launcher hotfix staging
+- Codex repair is fail-soft: a missing or unverifiable hotfix binary no longer discards successful stale-row or trust repair work; the skip reason is captured in the audit record and surfaced to CLI, GUI, and tray output
+- Docker / WSL checks and guarded `.wslconfig` / runtime repair flows
 - profile diagnostics with guided recovery notes
-- bundle export
-- tray and GUI entry points
+- bundle export with retention
+- tray and GUI entry points that invoke the same repair pipeline as the CLI
 
 ## Security and privacy
 
