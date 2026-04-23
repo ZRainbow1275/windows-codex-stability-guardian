@@ -1,5 +1,10 @@
 # Windows Codex Stability Guardian
 
+## 社区支持
+学 AI , 上 L 站
+
+[LinuxDO](https://linux.do/)
+
 [![CI](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml)
 [![Release](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml)
 
