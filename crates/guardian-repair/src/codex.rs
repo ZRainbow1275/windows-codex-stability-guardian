@@ -52,6 +52,7 @@ pub struct CodexRepairExecution {
     pub outcome: CodexRepairOutcome,
     pub trust_repair: Option<CodexTrustRepair>,
     pub slow_path_repair: Option<CodexSlowPathRepair>,
+    pub slow_path_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,14 +119,15 @@ impl CodexRepairExecution {
                 }
             }
             CodexRepairOutcome::Unresolved => {
-                if repaired_steps.is_empty() {
-                    "Codex repair confirm executed, but stale rows still remain after verification."
-                        .to_string()
+                let tail = if self.slow_path_error.is_some() {
+                    "but the Codex slow-path launcher hotfix step was skipped due to an error (see notes)."
                 } else {
-                    format!(
-                        "Codex repair confirm {}, but stale rows still remain after verification.",
-                        repaired_steps.join(", ")
-                    )
+                    "but stale rows still remain after verification."
+                };
+                if repaired_steps.is_empty() {
+                    format!("Codex repair confirm executed, {tail}")
+                } else {
+                    format!("Codex repair confirm {}, {tail}", repaired_steps.join(", "))
                 }
             }
         }
@@ -202,6 +204,11 @@ impl CodexRepairExecution {
                 slow_path_repair.hotfix_binary_updated
             ));
         }
+        if let Some(slow_path_error) = &self.slow_path_error {
+            notes.push(format!(
+                "Codex slow-path launcher hotfix was skipped: {slow_path_error}"
+            ));
+        }
         if !self.stdout_excerpt.is_empty() {
             notes.push(format!(
                 "Script stdout excerpt: {}",
@@ -259,6 +266,7 @@ pub fn execute_confirmed(
         outcome: CodexRepairOutcome::Noop,
         trust_repair: None,
         slow_path_repair: None,
+        slow_path_error: None,
     };
 
     if repair_stale_rows {
@@ -315,11 +323,23 @@ pub fn execute_confirmed(
     }
 
     if repair_slow_path {
-        let slow_path_repair = apply_slow_path_repair()?;
-        if slow_path_repair.launcher_updated || slow_path_repair.hotfix_binary_updated {
-            execution.outcome = CodexRepairOutcome::Repaired;
+        match apply_slow_path_repair() {
+            Ok(slow_path_repair) => {
+                if slow_path_repair.launcher_updated || slow_path_repair.hotfix_binary_updated {
+                    execution.outcome = CodexRepairOutcome::Repaired;
+                }
+                execution.slow_path_repair = Some(slow_path_repair);
+            }
+            Err(error) => {
+                // Slow-path failures must not discard successful stale-row or trust
+                // repair work. Capture the failure so the caller can persist an audit
+                // record and surface actionable evidence to CLI/GUI/tray outputs.
+                execution.slow_path_error = Some(error.to_string());
+                if execution.outcome == CodexRepairOutcome::Noop {
+                    execution.outcome = CodexRepairOutcome::Unresolved;
+                }
+            }
         }
-        execution.slow_path_repair = Some(slow_path_repair);
     }
 
     Ok(execution)
@@ -903,9 +923,10 @@ struct ProcessOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_VERSION_PREFIX, BACKUP_PREFIX, REPAIR_PREFIX, active_version_from_output,
-        backup_path_from_output, command_with_project_path, ensure_hotfix_launcher_patch,
-        hotfix_source_candidates, normalize_repair_prefix, parse_semver_fragment,
+        ACTIVE_VERSION_PREFIX, BACKUP_PREFIX, CodexRepairExecution, CodexRepairOutcome,
+        CodexTrustRepair, REPAIR_PREFIX, active_version_from_output, backup_path_from_output,
+        command_with_project_path, ensure_hotfix_launcher_patch, hotfix_source_candidates,
+        normalize_repair_prefix, parse_semver_fragment,
     };
     use std::path::{Path, PathBuf};
 
@@ -994,6 +1015,73 @@ const binaryPath = existsSync(hotfixBinaryPath)
             ensure_hotfix_launcher_patch(patched).expect("launcher patch should stay valid");
         assert!(!updated);
         assert_eq!(second_pass, patched);
+    }
+
+    fn sample_trust_repair() -> CodexTrustRepair {
+        CodexTrustRepair {
+            target_project_path: PathBuf::from(r"D:\Desktop\CREATOR SIX"),
+            target_source: "cli_argument".to_string(),
+            config_path: PathBuf::from(r"C:\Users\HP\.codex\config.toml"),
+            config_backup_path: Some(PathBuf::from(
+                r"C:\Users\HP\AppData\Local\guardian\backups\codex-config-20260423-120000.toml.bak",
+            )),
+            missing_keys_before: vec![r"D:\Desktop\CREATOR SIX".to_string()],
+            added_keys: vec![r"D:\Desktop\CREATOR SIX".to_string()],
+            created_config: false,
+        }
+    }
+
+    #[test]
+    fn slow_path_error_preserves_trust_repair_and_surfaces_note() {
+        // Simulates the soft-failure branch of `execute_confirmed` where
+        // `apply_slow_path_repair` failed (e.g. no hotfix binary available on
+        // the workstation) but stale-row and trust repair already landed. The
+        // execution must still be returned so the audit can be persisted and
+        // the CLI/GUI/tray surfaces show the actionable error.
+        let mut execution = CodexRepairExecution {
+            script_path: None,
+            state_db_path: None,
+            backup_path: None,
+            stale_rows_before: None,
+            stale_rows_after: None,
+            active_version: None,
+            stdout_excerpt: Vec::new(),
+            stderr_excerpt: Vec::new(),
+            outcome: CodexRepairOutcome::Repaired,
+            trust_repair: Some(sample_trust_repair()),
+            slow_path_repair: None,
+            slow_path_error: Some(
+                "unable to locate a verified Codex hotfix binary".to_string(),
+            ),
+        };
+        // Trust repair succeeded so the overall outcome stays `Repaired`; the
+        // skip is reported as an evidence/note and does not downgrade prior work.
+        assert!(execution.is_successful());
+        let summary = execution.outcome_summary();
+        assert!(
+            summary.contains("appended missing trusted project entries"),
+            "summary should still list trust repair work: {summary}"
+        );
+        let notes = execution.notes();
+        assert!(
+            notes.iter().any(|note| note.contains("slow-path launcher hotfix was skipped")
+                && note.contains("unable to locate a verified Codex hotfix binary")),
+            "notes must surface the slow-path skip reason: {notes:?}"
+        );
+
+        // With no prior successful work, the same soft-failure flips the
+        // outcome to Unresolved so the CLI exit code reflects the problem.
+        execution.outcome = CodexRepairOutcome::Noop;
+        execution.trust_repair = None;
+        if execution.outcome == CodexRepairOutcome::Noop {
+            execution.outcome = CodexRepairOutcome::Unresolved;
+        }
+        assert!(!execution.is_successful());
+        assert!(
+            execution
+                .outcome_summary()
+                .contains("slow-path launcher hotfix step was skipped")
+        );
     }
 
     #[test]

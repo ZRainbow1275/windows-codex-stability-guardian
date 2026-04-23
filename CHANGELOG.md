@@ -6,6 +6,23 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- `guardian repair codex --confirm` no longer aborts the entire run and discards
+  successful stale-row (`C2`) or trusted-project (`C6`) repair work when the
+  slow-path (`C4`) launcher hotfix step fails (for example, when no verified
+  hotfix binary is present on the workstation, or when the launcher vendor
+  block can no longer be located). The failure is captured as
+  `repair_slow_path_error` evidence, recorded in the audit record, surfaced in
+  CLI / GUI / tray notes, and the outcome is reported as `unresolved` instead of
+  a hard error. This preserves the audit trail and any earlier successful
+  repair work on machines where the hotfix source is not yet staged.
+
+### Documentation
+
+- README now states the project's creation purpose and the concrete failure
+  classes it was built to handle.
+
 ## [0.1.0] - 2026-04-19
 
 ### Added

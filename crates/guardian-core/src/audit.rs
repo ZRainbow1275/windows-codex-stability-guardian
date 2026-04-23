@@ -37,6 +37,7 @@ pub struct RepairAuditRecord {
     pub slow_path_hotfix_source_path: Option<String>,
     pub slow_path_launcher_updated: bool,
     pub slow_path_hotfix_binary_updated: bool,
+    pub slow_path_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
