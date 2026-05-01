@@ -1,4 +1,4 @@
-# Windows Codex Stability Guardian
+# Windows Codex 稳定性守护工具（Windows Codex Stability Guardian）
 
 ## 社区支持
 学 AI , 上 L 站
@@ -8,230 +8,309 @@
 [![CI](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml)
 [![Release](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml)
 
-Windows-native local stability tooling for Codex CLI, Docker Desktop / WSL2, and Windows User Profile diagnostics.
+面向 Windows 工作站的本地稳定性工具，覆盖 Codex CLI、Docker Desktop / WSL2、以及 Windows 用户配置文件三个常见故障域。
 
-Guardian is a conservative workstation operations tool built for a very specific job: detect recurring local failure classes, classify them from live machine evidence, and only repair them when the repair path is known, bounded, and explicitly confirmed.
+Guardian 的目标只有一个：把 Codex / Docker / Profile 这一类**反复出现、根因在本地状态漂移**的小故障，变成可观察、可证据化、可在 `--confirm` 守护下安全修复的事项；其它无法分类的情况一律只报告、绝不动手。
 
-## Why this project exists
+---
 
-Guardian was created to solve a concrete problem: developers on Windows workstations lose hours every week to a small set of recurring local failures that look scarier than they are, and the usual response — reinstall, reboot, re-clone — either hides the underlying drift or destroys work that could have been saved.
+## 为什么做这个项目
 
-Typical symptoms Guardian was built for:
+OpenAI Codex CLI 在 Windows 上有一组反复被报告、长期未修复或修复不彻底的本地故障。受影响最严重的是 `/resume`、侧边栏历史、`codex resume` 三个入口。这些症状共同特征是：**会话文件其实还在磁盘上，但 Codex 因本地数据库 / 配置 / 启动器漂移而读不出来**。
 
-- Codex CLI `/resume` stops loading recent sessions or stalls on `Loading sessions…`
-- Codex rejects an otherwise legitimate project path because its trusted-project list has drifted
-- Docker Desktop or WSL2 refuses to start cleanly after a Windows update, or `.wslconfig` no longer matches the baseline the team agreed on
-- Windows logs the user into a temporary profile, or `ProfileList` shows registry-lock evidence that a naive fix could make worse
+Guardian 直接对位以下上游 issues：
 
-What these incidents have in common:
+| 上游 Issue | 现象（Windows） | Guardian 分类 | 修复策略 |
+| --- | --- | --- | --- |
+| [openai/codex#14469](https://github.com/openai/codex/issues/14469) | Severe chat-switch lag；线程切换 / `/resume` 卡顿（issue 已 closed，但 slow-path 症状仍可在 0.x 版本上复现） | **C4** | TUI 日志检测到 `Loading sessions...`，在 `--confirm` 下做启动器（launcher）补丁 + `vendor-hotfix\codex.exe` 旁路二进制 |
+| [openai/codex#17540](https://github.com/openai/codex/issues/17540) | Windows 桌面应用重启后侧边栏历史会话丢失，但磁盘上 sessions 还在（open） | **C2** | 备份 `state_*.sqlite` → 清除最新 state DB 中的 stale rows（`threads.has_user_event` 漂移），让 Codex 重新认得磁盘上的会话 |
+| [openai/codex#15007](https://github.com/openai/codex/issues/15007) | `/resume` 或 `codex resume` 不加载 project config（open） | **C6 + C2** | 备份 `%USERPROFILE%\.codex\config.toml` → 补回缺失的 trusted project 条目；同时清理 stale rows 让会话重新可见 |
+| [openai/codex#14756](https://github.com/openai/codex/issues/14756) | Codex CLI 即使是简单请求也响应极慢（open） | **C4（+C2）** | 与 #14469 同一条 slow-path 路径：状态库 stale rows + TUI `Loading sessions` 联合判定，按需走启动器 hotfix |
+| [openai/codex#14949](https://github.com/openai/codex/issues/14949) | Windows shell 任务被中断后留下孤儿子进程；重启 Codex 时可能进入 process storm（open） | **诊断 + 证据导出**（不自动 kill） | `guardian diagnose profile` + `guardian export bundle` 收集证据；不自动终止进程，避免误杀安全软件或 vmmem |
 
-- The root cause is local state drift, not code
-- The safe fix is narrow and well-understood, but risky to run by hand
-- Running the wrong "fix" (an ad-hoc registry edit, a full Codex reinstall, a force-kill of `vmmem`) can turn a 30-second drift into a day of recovery
+> 注：Guardian 不"代替"上游修复，也不长驻后台修改你的环境。它只在你显式给出 `--confirm` 时执行已分类的修复路径，其余情况下只做只读观察、写出结构化健康报告与审计文件。
 
-Guardian's job is to make that class of problem **observable first** and **repairable second**, and to refuse to touch anything it cannot classify. It is the tool a careful operator would build for themselves after being burned once too often by "just reinstall it" advice.
+---
 
-Operating principles:
+## 工作原则
 
-- **Observe before repair** — every repair starts from live machine evidence, not from assumptions
-- **Backup before write** — SQLite state, `config.toml`, and Codex launcher are backed up before any mutation
-- **Explicit confirmation before mutation** — `--confirm` is required; no background auto-fix
-- **Bounded repair surface** — Guardian only repairs failure classes it can classify from evidence; anything else is reported, not touched
-- **Windows-native, low-overhead operation** — runs on the workstation, uses Windows Event Log, registry reads, and PowerShell where appropriate
-- **No dependence on remote services** — no telemetry, no cloud, no account required
+- **先观察再修复** — 每一次修复都从 live 机器证据出发，绝不基于假设
+- **先备份再写入** — SQLite、`config.toml`、Codex 启动器在变更前一律备份
+- **先确认再变更** — 必须显式 `--confirm`，没有后台自动修复
+- **修复面有界** — Guardian 只修它能从证据分类的故障类型；其余只报告、不触碰
+- **Windows 原生、低开销** — 工作站本地运行，使用 Windows 事件日志、注册表读取、必要时调 PowerShell
+- **零远端依赖** — 不上报遥测、不调用云、不需要账号
 
-## What Guardian does
+---
 
-### Codex health and repair
+## 故障分类表（C / D / P）
 
-Guardian can inspect a local Codex home, classify common `/resume` failure modes, detect project trust drift, and run a managed Codex repair flow when the known drift patterns are present.
+Guardian 用证据驱动的失败分类系统，将本地故障落到具体的"故障类（FailureClass）"上。
 
-Key behaviors:
+### Codex 域
 
-- checks `history.jsonl`, rollout/session files, and the latest `state_*.sqlite`
-- detects `threads.has_user_event` drift
-- detects `/resume` slow-path drift from `codex-tui.log` when recent runs stall on `Loading sessions...`
-- detects missing trusted project entries in `%USERPROFILE%\.codex\config.toml`
-- runs the managed repair playbook only when you explicitly pass `--confirm`
-- creates a SQLite backup before mutation
-- creates a `config.toml` backup before appending trusted project entries
-- creates a launcher backup before staging a controlled `vendor-hotfix` binary and patching the Codex launcher for validated `C4` slow-path cases
-- verifies post-write state before declaring success
-- writes a structured repair audit after execution
-
-### Docker / WSL baseline recovery
-
-Guardian inspects Docker Desktop, WSL state, and `.wslconfig`, then applies bounded recovery flows for known baseline or runtime anomalies.
-
-Key behaviors:
-
-- validates `.wslconfig` baseline keys
-- distinguishes configuration drift from runtime recovery
-- blocks high-risk runtime restart flows when running containers make that unsafe
-- writes repair audits for confirm-mode actions
-
-### Profile diagnostics
-
-Guardian reads Windows profile-related event evidence and turns it into guided recovery steps without modifying the system.
-
-Key behaviors:
-
-- reads User Profile Service evidence
-- classifies registry-lock and temporary-profile signals
-- detects when security software involvement is likely
-- exports structured diagnostic JSON
-
-### Bundle export
-
-Guardian can export a support bundle containing current health output, profile diagnostics, and audit summaries.
-
-## When to use it
-
-Guardian is a good fit when you want:
-
-- a local-first Windows diagnostics tool
-- a safer alternative to ad hoc workstation repair scripts
-- structured health output before making system changes
-- bounded repair paths for recurring Codex or Docker / WSL issues
-
-Guardian is **not** positioned as:
-
-- a cloud service
-- a fleet-management platform
-- a generic Windows optimizer
-- an automatic registry fixer for user-profile corruption
-
-## Command overview
-
-| Command | Purpose | Mutation boundary |
+| 分类 | 含义 | 触发证据 |
 | --- | --- | --- |
-| `guardian.exe check` | Run workstation health checks | Read-only |
-| `guardian.exe repair codex` | Inspect and optionally repair known Codex drift | Requires `--confirm` for writes |
-| `guardian.exe repair docker` | Inspect and optionally repair Docker / WSL baseline/runtime issues | Requires `--confirm` for writes |
-| `guardian.exe diagnose profile` | Export profile-related diagnostics and guided recovery notes | Read-only |
-| `guardian.exe export bundle` | Export a support bundle from current health and audit data | Read-only with respect to monitored systems |
-| `guardian.exe gui` | Launch the desktop GUI | No automatic repair without explicit action |
-| `guardian.exe tray` | Launch the tray entry point | No automatic repair without explicit action |
+| `C2` | Codex 状态数据库漂移（**stale rows**） | 最新 `state_*.sqlite` 中 `threads.has_user_event` 出现陈旧记录 |
+| `C3` | Codex 版本处于已知风险窗口 | `codex --version` 落在已知会触发 picker bug 的版本范围 |
+| `C4` | `/resume` slow-path 漂移 | `~/.codex/log/codex-tui.log` 近期含 `Loading sessions...` |
+| `C5` | 配置访问错误 | TUI 日志含 config / access error；或 `config.toml` 解析失败 |
+| `C6` | trusted-project 漂移 | `%USERPROFILE%\.codex\config.toml` 缺少当前项目的 trust 条目 |
 
-## Quick start
+### Docker / WSL 域 与 Profile 域
 
-### 1. Download a release
+`D1`–`D4` 覆盖 `.wslconfig` 基线漂移、Docker / WSL 运行时状态；`P1`–`P4` 覆盖 Windows 用户配置文件相关事件（Temp Profile、ProfileList 注册表锁、安全软件介入等）。Profile 域**全程只读**，不会修改 ProfileList。
 
-Get the latest release assets from:
+---
 
-- [Releases](https://github.com/ZRainbow1275/windows-codex-stability-guardian/releases)
+## Guardian 能做什么
 
-Each release publishes:
+### Codex 健康检查与修复
 
-- `guardian-v<version>-windows-x64.zip`
-- `guardian.exe`
-- `SHA256SUMS.txt`
+- 读取 `~/.codex` 下的 `history.jsonl`、rollout / session 文件、最新 `state_*.sqlite`
+- 分类 `C2`（stale rows）/ `C4`（slow-path）/ `C6`（trust 漂移）等
+- 在 `--confirm` 下：
+  - 备份 SQLite → 清理 stale rows → post-write 校验
+  - 备份 `config.toml` → 追加 trusted project 条目
+  - 在已存在已验证 hotfix 二进制时，备份原启动器 → 替换为 `vendor-hotfix\codex.exe`
+- 即使 slow-path（`C4`）那一步因为没有可用 hotfix 而失败，也**不会回滚**前面已经成功的 stale-row / trust 修复；失败原因写入审计
 
-### 2. Verify what you downloaded
+### Docker / WSL 基线恢复
 
-Recommended verification flow:
+- 校验 `.wslconfig` 基线键
+- 区分"配置漂移"和"运行时恢复"
+- 若有运行中的容器，会主动**阻止**高风险的 runtime 重启
+- `--confirm` 模式下写出审计
 
-1. Verify the Git tag is shown as signed / verified on GitHub.
-2. Download the release zip and `SHA256SUMS.txt`.
-3. Verify the checksum locally:
+### Profile 诊断（只读）
+
+- 读 User Profile Service 事件
+- 分类 Temp Profile / ProfileList 注册表锁信号
+- 检测安全软件介入迹象
+- 输出结构化诊断 JSON
+- **永远不会**自动改 ProfileList，也不会终止安全软件进程
+
+### Bundle 导出
+
+- 把当前健康报告、profile 诊断、审计摘要打包成支持 bundle，便于事后排查或团队协助
+
+---
+
+## 命令一览
+
+| 命令 | 用途 | 写入边界 |
+| --- | --- | --- |
+| `guardian.exe check` | 跑只读健康检查 | 只读 |
+| `guardian.exe repair codex` | 检查 + 可选修复 Codex 漂移 | 写入需 `--confirm` |
+| `guardian.exe repair docker` | 检查 + 可选修复 Docker / WSL 漂移 | 写入需 `--confirm` |
+| `guardian.exe diagnose profile` | 输出 profile 诊断 + 引导式恢复建议 | 只读 |
+| `guardian.exe export bundle` | 导出当前健康 + 审计支持 bundle | 只读（对被监控系统） |
+| `guardian.exe gui` | 启动桌面 GUI | 无显式动作不修复 |
+| `guardian.exe tray` | 启动系统托盘入口 | 无显式动作不修复 |
+
+> **注意**：`guardian.exe` 是 CLI 程序。在文件管理器里直接双击会因没有子命令而立即退出（看起来"无反应"）。请在 PowerShell / CMD 里运行；想要常驻后台 UI，请用 `guardian.exe tray`。
+
+---
+
+## 快速开始
+
+### 1. 下载 Release
+
+从 [Releases](https://github.com/ZRainbow1275/windows-codex-stability-guardian/releases) 获取：
+
+- `guardian-v<version>-windows-x64.zip` ← **推荐**：含 `guardian.exe` + README/CHANGELOG/LICENSE，打包机器存在 hotfix 时还会附带 `vendor-hotfix\x86_64-pc-windows-msvc\codex\codex.exe`
+- `guardian.exe` ← 单文件覆盖升级用，**不含** hotfix 二进制和文档
+- `SHA256SUMS.txt` ← 校验文件
+
+### 2. 校验下载
+
+推荐流程：
+
+1. 在 GitHub 上确认 tag 是 signed / verified
+2. 下载 zip 与 `SHA256SUMS.txt`
+3. 本地校验 hash：
 
 ```powershell
-Get-FileHash .\guardian-v0.1.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\guardian-v0.1.1-windows-x64.zip -Algorithm SHA256
 ```
 
-Compare the output against `SHA256SUMS.txt`.
+把输出和 `SHA256SUMS.txt` 对照。
 
-### 3. Start with a read-only health check
+### 3. 先跑只读体检
 
 ```powershell
-guardian.exe check --json
+guardian.exe --json check
 ```
 
-### 4. Escalate only when needed
+这一步**纯只读**，不会动你机器上任何东西。看它在 `domains.codex.evidence` 里报告的 `failure_classes` 是 `C2 / C4 / C6` 中的哪些。
+
+### 4. 按需升级到修复
 
 ```powershell
-guardian.exe repair codex --dry-run --json
-guardian.exe repair codex --confirm --json
-guardian.exe repair docker --dry-run --json
-guardian.exe diagnose profile --json --output profile-diagnosis.json
-guardian.exe export bundle --json
+# Codex：先 dry-run 看会做什么
+guardian.exe --json repair codex --dry-run
+
+# 真正执行（备份后修复 stale rows / trust / slow-path）
+guardian.exe --json repair codex --confirm
+
+# Docker / WSL 基线
+guardian.exe --json repair docker --dry-run
+
+# Profile 只读诊断
+guardian.exe --json diagnose profile --output profile-diagnosis.json
+
+# 打 support bundle
+guardian.exe --json export bundle
+
+# 常驻托盘 UI
 guardian.exe tray
 ```
 
-## Safety model
+---
 
-Guardian is intentionally conservative:
+## 上游 Issue 与操作 cheat sheet
 
-- `guardian.exe check` is always read-only
-- write actions are gated behind `--confirm`
-- Codex repairs back up the active SQLite state database first
-- Codex slow-path launcher staging is only allowed inside `guardian repair codex --confirm` after Guardian has classified `C4` and found a verified local hotfix binary
-- profile diagnostics never auto-edit `ProfileList` or terminate security software
-- runtime restart flows for Docker / WSL are guarded by live machine state
+> 想直接对症操作，按下面的步骤走。
 
-## Operational data paths
+### 症状对应 #14469 / #14756（slow-path、`/resume` 卡顿）
 
-By default Guardian uses:
+```powershell
+# 1. 体检：看 codex 域的 failure_classes 是否包含 C4
+guardian.exe --json check
 
-- audits: `%LOCALAPPDATA%\guardian\audits`
-- bundles: `%LOCALAPPDATA%\guardian\bundles`
-- backups: `%LOCALAPPDATA%\guardian\backups`
+# 2. 在 dry-run 下确认 Guardian 打算做什么
+guardian.exe --json repair codex --dry-run
 
-## Repository layout
+# 3. 如果机器上已有可用的 hotfix codex.exe（位于 %TEMP%\codex-src\codex-rs\target\release\codex.exe
+#    或 release zip 内 vendor-hotfix 路径），执行：
+guardian.exe --json repair codex --confirm
+```
 
-| Path | Purpose |
+`C4` 修复链：备份 Codex 启动器（launcher） → 把启动器指向 `vendor-hotfix\codex.exe` → post-write 校验。**没有 hotfix 时不会瞎动**：失败原因写入审计 + CLI / GUI / tray notes，前面已成功的 `C2 / C6` 修复**不回滚**。
+
+### 症状对应 #17540（重启后侧边栏历史丢失）
+
+```powershell
+guardian.exe --json check                       # 应看到 C2，evidence.stale_rows > 0
+guardian.exe --json repair codex --dry-run
+guardian.exe --json repair codex --confirm      # 备份 sqlite → 清 stale rows → 校验
+```
+
+修完之后重启 Codex 桌面应用，侧边栏历史应该重新出现。
+
+### 症状对应 #15007（`/resume` 不加载 project config）
+
+```powershell
+# 在出问题的项目根目录里跑（让 Guardian 知道目标 project path）
+cd D:\path\to\your\project
+guardian.exe --json check                                       # 应看到 C6
+guardian.exe --json repair codex --dry-run
+guardian.exe --json repair codex --confirm
+```
+
+修复链：备份 `%USERPROFILE%\.codex\config.toml` → 追加当前 project 的 trusted project 条目 → 重新解析校验。
+
+### 症状对应 #14949（孤儿子进程 / process storm）
+
+Guardian **不会自动 kill 进程**，因为误杀 `vmmem` 或安全软件代价过大。它的角色是**证据收集**：
+
+```powershell
+# 1. 立即抓 profile + Codex 域证据（只读）
+guardian.exe --json diagnose profile --output profile-diagnosis.json
+guardian.exe --json export bundle
+
+# 2. 把 bundle（默认在 %LOCALAPPDATA%\guardian\bundles 下）和 profile-diagnosis.json
+#    一并附在 issue / 求助贴里
+```
+
+之后再决定是手动 `taskkill /T` 进程树、重启 Codex，还是按 issue #14949 里讨论的 workaround 处理。
+
+---
+
+## 安全模型
+
+Guardian 故意做得很保守：
+
+- `guardian.exe check` 永远只读
+- 写入操作必须经过 `--confirm`
+- Codex 修复**先备份**当前 state SQLite
+- Codex slow-path（`C4`）启动器替换**只在** `guardian repair codex --confirm` 内、且 Guardian 已经分类为 `C4`、且找到已验证的 hotfix 二进制时才执行
+- Profile 诊断**永不**自动编辑 `ProfileList`，**永不**终止安全软件
+- Docker / WSL 的运行时重启会先看 live 机器状态再决定是否拒绝
+
+---
+
+## 数据路径
+
+默认位置：
+
+- 审计：`%LOCALAPPDATA%\guardian\audits`
+- 支持 bundle：`%LOCALAPPDATA%\guardian\bundles`
+- 备份（SQLite / config.toml / launcher）：`%LOCALAPPDATA%\guardian\backups`
+
+---
+
+## 仓库结构
+
+| 路径 | 用途 |
 | --- | --- |
-| `apps/guardian/` | Main application entry points, CLI, tray, GUI, and packaging script |
-| `crates/guardian-core/` | Shared domain types, policies, and audit structures |
-| `crates/guardian-observers/` | Read-only machine evidence collection and classifiers |
-| `crates/guardian-repair/` | Repair orchestration, bundle export, and guarded write paths |
-| `crates/guardian-windows/` | Windows-specific helpers for paths, event logs, process execution, and registry-facing utilities |
-| `.github/workflows/` | CI and tag-driven release automation |
+| `apps/guardian/` | 主程序入口、CLI、托盘、GUI、打包脚本 |
+| `crates/guardian-core/` | 共享类型、策略、审计结构 |
+| `crates/guardian-observers/` | 只读机器证据采集与分类器 |
+| `crates/guardian-repair/` | 修复编排、bundle 导出、守护写入路径 |
+| `crates/guardian-windows/` | Windows 专用辅助：路径、事件日志、进程执行、注册表 |
+| `.github/workflows/` | CI 与 tag 驱动的发布流水线 |
 
-## Development
+---
 
-### Requirements
+## 开发
+
+### 环境
 
 - Windows
-- Rust stable toolchain
+- Rust stable
 - PowerShell
 
-### Local build
+### 本地构建
 
 ```powershell
 cargo build -p guardian
 cargo test --workspace
 ```
 
-### Local release packaging
+### 本地打 release 包
 
 ```powershell
-.\apps\guardian\scripts\package-release.ps1 -Version v0.1.0
+.\apps\guardian\scripts\package-release.ps1 -Version v0.1.1
 ```
 
-The packaging script writes artifacts under `dist\<version>\`.
+产物落到 `dist\<version>\`。如果打包机的 `%TEMP%\codex-src\codex-rs\target\release\codex.exe` 已存在已验证的 Codex slow-path hotfix 二进制，会自动复制到 `vendor-hotfix\<triple>\codex\`，使 release 构建无需依赖原始 temp 路径就能完成 `C4` 修复。
 
-## Project status
+---
 
-Current release line: **v0.1.0**
+## 项目状态
 
-Implemented and wired:
+当前发布线：**v0.1.1**
 
-- Codex health checks (history, sessions, state SQLite, TUI log, trusted-project config)
-- Codex managed repair orchestration for stale-row drift (`C2`), trusted-project drift (`C6`), and `/resume` slow-path drift (`C4`) with guarded launcher hotfix staging
-- Codex repair is fail-soft: a missing or unverifiable hotfix binary no longer discards successful stale-row or trust repair work; the skip reason is captured in the audit record and surfaced to CLI, GUI, and tray output
-- Docker / WSL checks and guarded `.wslconfig` / runtime repair flows
-- profile diagnostics with guided recovery notes
-- bundle export with retention
-- tray and GUI entry points that invoke the same repair pipeline as the CLI
+已实现并接通：
 
-## Security and privacy
+- Codex 健康检查（history、sessions、state SQLite、TUI 日志、trusted-project 配置）
+- Codex 托管修复编排：`C2`（stale rows）/ `C6`（trust 漂移）/ `C4`（slow-path）三链联合执行
+- 修复链 fail-soft：`C4` 步骤失败不会丢弃前面已成功的 `C2 / C6` 修复，失败原因落到审计
+- Docker / WSL 检查与守护下的 `.wslconfig` / runtime 修复
+- Profile 诊断与引导式恢复
+- Bundle 导出（含保留策略）
+- Tray 与 GUI 入口，复用 CLI 同一条修复管线
 
-This public repository is intentionally kept free of machine-specific secrets, private session artifacts, and local workstation-only notes.
+---
 
-See:
+## 安全与隐私
 
-- [SECURITY.md](./SECURITY.md)
+本仓库刻意不包含机器特定的密钥、私有 session 文件或仅本地的笔记。
+
+参见 [SECURITY.md](./SECURITY.md)。
+
+---
 
 ## License
 
