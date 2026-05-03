@@ -17,9 +17,3 @@
 *.log
 Thumbs.db
 .DS_Store
-
-# Local cache of the trusted Codex hotfix binary used by package-release.ps1.
-# Maintainers stage `vendor-hotfix/<target-triple>/codex/codex.exe` here so the
-# release packager can find it without a fresh Codex source build. The binary
-# is huge (>200 MB) and must NOT be committed to git.
-/vendor-hotfix/

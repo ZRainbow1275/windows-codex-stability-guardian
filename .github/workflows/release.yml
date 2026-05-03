@@ -4,22 +4,9 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      codex_ref:
-        description: "openai/codex git ref (tag/branch/sha) to build the C4 hotfix binary from"
-        required: false
-        default: ""
 
 permissions:
   contents: write
-
-env:
-  # Pin the upstream Codex source ref CI builds the slow-path hotfix binary
-  # from. Override per-run via the workflow_dispatch input above. Bump this
-  # whenever a newer codex-cli release ships a fix Guardian's slow-path repair
-  # depends on.
-  CODEX_DEFAULT_REF: rust-vrust-v0.122.0-alpha.4
 
 jobs:
   build-windows:
@@ -32,72 +19,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo artifacts (Guardian)
+      - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-
-      - name: Resolve Codex hotfix ref
-        id: codex
-        shell: pwsh
-        run: |
-          $ref = "${{ inputs.codex_ref }}"
-          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = "${{ env.CODEX_DEFAULT_REF }}" }
-          "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Codex hotfix ref: $ref"
-
-      - name: Clone Codex source
-        shell: pwsh
-        run: |
-          $dest = Join-Path $env:RUNNER_TEMP "codex-src"
-          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
-          git clone --depth 1 --branch "${{ steps.codex.outputs.ref }}" https://github.com/openai/codex.git $dest
-          Get-Item $dest | Select-Object FullName, LastWriteTime
-
-      - name: Cache Codex cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ${{ runner.temp }}\codex-src\codex-rs -> target
-          key: codex-${{ steps.codex.outputs.ref }}
-          shared-key: codex-hotfix
-
-      - name: Build Codex hotfix binary
-        shell: pwsh
-        run: |
-          $codexRs = Join-Path $env:RUNNER_TEMP "codex-src\codex-rs"
-          Push-Location $codexRs
-          try {
-            cargo build --release -p codex-cli
-            $bin = Join-Path $codexRs "target\release\codex.exe"
-            if (-not (Test-Path -LiteralPath $bin)) { throw "codex.exe not produced at $bin" }
-            $info = Get-Item $bin
-            $hash = (Get-FileHash -LiteralPath $bin -Algorithm SHA256).Hash.ToLowerInvariant()
-            Write-Host ("codex.exe: {0}" -f $info.FullName)
-            Write-Host ("  size:   {0:N0} bytes" -f $info.Length)
-            Write-Host ("  sha256: {0}" -f $hash)
-          } finally {
-            Pop-Location
-          }
-
-      - name: Mirror Codex hotfix into package-release candidate path
-        shell: pwsh
-        run: |
-          # package-release.ps1 candidate #4 is `%TEMP%\codex-src\codex-rs\target\release\codex.exe`.
-          # GitHub Actions windows-latest sets `$env:TEMP` and `$env:RUNNER_TEMP` to
-          # different directories (TEMP -> per-step user-temp, RUNNER_TEMP -> shared
-          # runner workspace). The clone above uses RUNNER_TEMP so the build cache survives
-          # across steps; mirror it into TEMP so package-release.ps1 finds it without
-          # platform-specific path tweaks.
-          $expected = Join-Path $env:TEMP "codex-src\codex-rs\target\release\codex.exe"
-          $built    = Join-Path $env:RUNNER_TEMP "codex-src\codex-rs\target\release\codex.exe"
-          if (-not (Test-Path -LiteralPath $built)) { throw "Built codex.exe missing at $built" }
-          if ($built -ne $expected) {
-            New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($expected)) -Force | Out-Null
-            Copy-Item -LiteralPath $built -Destination $expected -Force
-          }
-          Get-Item $expected | Select-Object FullName, Length
 
       - name: Package release
         shell: pwsh
-        run: .\apps\guardian\scripts\package-release.ps1 -Version "${{ github.ref_name }}" -HotfixSha256 ""
+        run: .\apps\guardian\scripts\package-release.ps1 -Version "${{ github.ref_name }}"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
