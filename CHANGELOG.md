@@ -6,6 +6,25 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+
+- `release` GitHub Actions workflow now clones `openai/codex` at a pinned ref
+  (`CODEX_DEFAULT_REF`, default `rust-vrust-v0.122.0-alpha.4`) and builds
+  `codex-cli` from source on the runner. The resulting `codex.exe` is mirrored
+  to the `%TEMP%\codex-src\codex-rs\target\release\` candidate path so
+  `package-release.ps1` finds it without a maintainer-staged
+  `vendor-hotfix/` cache. v0.1.2 and earlier release zips silently shipped
+  without the slow-path C4 hotfix because the workflow only had
+  `package-release.ps1` and no Codex source available; subsequent tag pushes
+  will now produce zips that include `vendor-hotfix/<triple>/codex/codex.exe`.
+- The release workflow gained a `workflow_dispatch.inputs.codex_ref` override
+  so maintainers can manually re-package an existing tag against a different
+  Codex commit without editing the workflow.
+- `package-release.ps1` is now invoked with `-HotfixSha256 ""` from CI, since
+  the SHA256 of a freshly-built `codex.exe` cannot match the hard-coded
+  default `927ece82…` (build environment differs from any prior maintainer
+  copy). The default SHA check still applies for local maintainer runs.
+
 ## [0.1.2] - 2026-05-03
 
 ### Fixed
