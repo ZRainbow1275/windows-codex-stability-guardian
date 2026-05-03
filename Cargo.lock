@@ -554,6 +554,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
 name = "fdeflate"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "guardian"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "clap",
@@ -937,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -946,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-observers"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "guardian-core",
  "guardian-windows",
@@ -956,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-repair"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "guardian-core",
@@ -965,12 +971,13 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "zip",
 ]
 
 [[package]]
 name = "guardian-windows"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "quick-xml 0.38.4",
 ]
@@ -2228,6 +2235,19 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.3.4",
+ "once_cell",
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "thiserror"

@@ -15,7 +15,7 @@ use guardian_repair::{
     codex as codex_repair, docker_wsl as docker_repair,
 };
 use guardian_windows::paths::guardian_audit_dir;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     cli::{
@@ -26,6 +26,7 @@ use crate::{
 };
 
 pub fn run(cli: Cli) -> Result<i32, GuardianError> {
+    deploy_codex_tools_best_effort();
     match cli.command {
         Command::Check(args) => handle_check(&cli.global, args),
         Command::Repair(args) => handle_repair(&cli.global, args),
@@ -33,6 +34,17 @@ pub fn run(cli: Cli) -> Result<i32, GuardianError> {
         Command::Export(args) => handle_export(&cli.global, args),
         Command::Gui(args) => handle_gui(&cli.global, args),
         Command::Tray(args) => handle_tray(&cli.global, args),
+    }
+}
+
+fn deploy_codex_tools_best_effort() {
+    match codex_repair::ensure_codex_tools_deployed() {
+        Ok(path) => {
+            info!(target: "guardian::startup", script = %path.display(), "codex tools deployed")
+        }
+        Err(error) => {
+            warn!(target: "guardian::startup", %error, "failed to deploy codex tools (will retry on demand)")
+        }
     }
 }
 
@@ -531,7 +543,7 @@ fn build_profile_diagnosis_report(
         timestamp(),
         DomainReports::single_profile(report.domains.profile.clone()),
         vec![ActionPlan::new(
-            "guardian diagnose profile --json".to_string(),
+            "guardian --json diagnose profile".to_string(),
             "Emit the current profile diagnosis in JSON for later automation.".to_string(),
             false,
         )],
@@ -665,7 +677,7 @@ fn build_health_report() -> Result<HealthReport, GuardianError> {
     }
     if profile_report.status != StatusLevel::Ok {
         actions.push(ActionPlan::new(
-            "guardian diagnose profile --json".to_string(),
+            "guardian --json diagnose profile".to_string(),
             "Export profile diagnostics without modifying the system.".to_string(),
             false,
         ));

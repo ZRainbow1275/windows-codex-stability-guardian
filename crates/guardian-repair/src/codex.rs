@@ -1,6 +1,6 @@
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -21,6 +21,13 @@ const SCRIPT_OUTPUT_LIMIT: usize = 8;
 const REPAIR_PREFIX: &str = "[codex-resume-repair]";
 const BACKUP_PREFIX: &str = "SQLite backup:";
 const ACTIVE_VERSION_PREFIX: &str = "Repair complete. Active version:";
+
+/// Trusted PowerShell repair script bundled into `guardian.exe`. The original lives at
+/// `apps/guardian/assets/tools/repair-codex-resume.ps1` and is materialized to
+/// `<codex_home>/tools/repair-codex-resume.ps1` on first repair run so end users never see
+/// the historical "trusted repair script is missing" hard-fail.
+const EMBEDDED_REPAIR_SCRIPT: &str =
+    include_str!("../../../apps/guardian/assets/tools/repair-codex-resume.ps1");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexRepairOutcome {
@@ -271,7 +278,7 @@ pub fn execute_confirmed(
 
     if repair_stale_rows {
         let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
-        let script_path = repair_script_path(&codex_home);
+        let script_path = ensure_repair_script_installed(&codex_home).map_err(GuardianError::Io)?;
         if !script_path.exists() {
             return Err(GuardianError::invalid_state(format!(
                 "trusted repair script is missing: {}",
@@ -349,6 +356,35 @@ fn repair_script_path(codex_home: &Path) -> PathBuf {
     codex_home.join("tools").join("repair-codex-resume.ps1")
 }
 
+/// Materialize the bundled repair script into `<codex_home>/tools/` if it is missing.
+///
+/// Returns the canonical script path. The function is idempotent: when the destination
+/// already exists its bytes are left untouched so user-side edits or upgrade-time backups
+/// are preserved. Failures during write surface as `io::Error` so callers can propagate
+/// them through `GuardianError::Io`.
+pub fn ensure_repair_script_installed(codex_home: &Path) -> std::io::Result<PathBuf> {
+    let script_path = repair_script_path(codex_home);
+    if script_path.exists() {
+        return Ok(script_path);
+    }
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&script_path, EMBEDDED_REPAIR_SCRIPT.as_bytes())?;
+    Ok(script_path)
+}
+
+/// Best-effort startup hook that lays down every Guardian-owned helper under `~/.codex/tools/`.
+///
+/// Today only `repair-codex-resume.ps1` is bundled; future additions should plug in here so
+/// the app entry point keeps a single deploy call. Errors are returned to the caller, which
+/// is expected to log-and-continue rather than abort startup.
+pub fn ensure_codex_tools_deployed() -> std::io::Result<PathBuf> {
+    let codex_home = codex_home_dir()?;
+    fs::create_dir_all(&codex_home)?;
+    ensure_repair_script_installed(&codex_home)
+}
+
 fn inspect_stale_rows(path: &Path) -> Result<i64, GuardianError> {
     let connection = Connection::open(path)
         .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
@@ -367,25 +403,21 @@ fn run_repair_script(
     state_db_path: &Path,
     target_version: Option<&str>,
 ) -> Result<ProcessOutput, GuardianError> {
-    let mut args = vec![
+    let bootstrap = render_repair_script_bootstrap(
+        script_path,
+        codex_home,
+        state_db_path,
+        target_version,
+        resolve_codex_shim_path().as_deref(),
+    );
+    let args = vec![
         OsString::from("-NoProfile"),
         OsString::from("-ExecutionPolicy"),
         OsString::from("Bypass"),
-        OsString::from("-File"),
-        script_path.as_os_str().to_os_string(),
-        OsString::from("-CodexHome"),
-        codex_home.as_os_str().to_os_string(),
-        OsString::from("-StateDbPath"),
-        state_db_path.as_os_str().to_os_string(),
-        OsString::from("-SkipInstall"),
+        OsString::from("-Command"),
+        OsString::from(bootstrap),
     ];
-
-    if let Some(target_version) = target_version {
-        args.push(OsString::from("-TargetVersion"));
-        args.push(OsString::from(target_version));
-    }
-
-    run_command("powershell", &args)
+    run_command_with_extra_path("powershell", &args, &repair_script_path_entries()?)
 }
 
 fn current_codex_version() -> Option<String> {
@@ -536,12 +568,25 @@ fn apply_slow_path_repair() -> Result<CodexSlowPathRepair, GuardianError> {
         .join(target_triple)
         .join("codex")
         .join(codex_binary_name());
-    let hotfix_source_path =
-        find_hotfix_source_binary(&package_root, target_triple)?.ok_or_else(|| {
+    let hotfix_source_candidates = hotfix_source_candidates(
+        &package_root,
+        &env::temp_dir(),
+        bundled_hotfix_root().as_deref(),
+        target_triple,
+        codex_binary_name(),
+    );
+    let hotfix_source_path = hotfix_source_candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .cloned()
+        .ok_or_else(|| {
+            let checked_paths = hotfix_source_candidates
+                .iter()
+                .map(|candidate| format!("`{}`", candidate.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
             GuardianError::invalid_state(format!(
-                "unable to locate a verified Codex hotfix binary; checked `{}` and `{}`",
-                hotfix_binary_path.display(),
-                temp_hotfix_build_path().display()
+                "unable to locate a verified Codex hotfix binary; checked {checked_paths}"
             ))
         })?;
 
@@ -656,6 +701,7 @@ fn find_hotfix_source_binary(
     for candidate in hotfix_source_candidates(
         package_root,
         &env::temp_dir(),
+        bundled_hotfix_root().as_deref(),
         target_triple,
         hotfix_binary_name,
     ) {
@@ -669,31 +715,40 @@ fn find_hotfix_source_binary(
 fn hotfix_source_candidates(
     package_root: &Path,
     temp_root: &Path,
+    bundled_root: Option<&Path>,
     target_triple: &str,
     binary_name: &str,
 ) -> Vec<PathBuf> {
-    vec![
+    let mut candidates = vec![
         package_root
             .join("vendor-hotfix")
             .join(target_triple)
             .join("codex")
             .join(binary_name),
+    ];
+    if let Some(bundled_root) = bundled_root {
+        candidates.push(
+            bundled_root
+                .join(target_triple)
+                .join("codex")
+                .join(binary_name),
+        );
+    }
+    candidates.push(
         temp_root
             .join("codex-src")
             .join("codex-rs")
             .join("target")
             .join("release")
             .join(binary_name),
-    ]
+    );
+    dedupe_paths(candidates).expect("path dedupe should be infallible")
 }
 
-fn temp_hotfix_build_path() -> PathBuf {
-    env::temp_dir()
-        .join("codex-src")
-        .join("codex-rs")
-        .join("target")
-        .join("release")
-        .join(codex_binary_name())
+fn bundled_hotfix_root() -> Option<PathBuf> {
+    let current_exe = env::current_exe().ok()?;
+    let exe_dir = current_exe.parent()?;
+    Some(exe_dir.join("vendor-hotfix"))
 }
 
 fn current_target_triple() -> Result<&'static str, GuardianError> {
@@ -831,15 +886,21 @@ fn looks_like_semver(token: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-fn run_command(program: &str, args: &[OsString]) -> Result<ProcessOutput, GuardianError> {
-    let output = match Command::new(program).args(args).output() {
+fn run_command_with_extra_path(
+    program: &str,
+    args: &[OsString],
+    extra_paths: &[PathBuf],
+) -> Result<ProcessOutput, GuardianError> {
+    let resolved_path = if extra_paths.is_empty() {
+        None
+    } else {
+        Some(build_path_with_prepend(extra_paths)?)
+    };
+
+    let output = match spawn_command(program, args, resolved_path.as_ref()) {
         Ok(output) => output,
         Err(error) if error.kind() == ErrorKind::NotFound && cfg!(target_os = "windows") => {
-            Command::new("cmd")
-                .arg("/C")
-                .arg(program)
-                .args(args)
-                .output()?
+            spawn_cmd_fallback(program, args, resolved_path.as_ref())?
         }
         Err(error) => return Err(GuardianError::Io(error)),
     };
@@ -866,6 +927,108 @@ fn run_command(program: &str, args: &[OsString]) -> Result<ProcessOutput, Guardi
             },
         })
     }
+}
+
+fn spawn_command(
+    program: &str,
+    args: &[OsString],
+    path_override: Option<&OsString>,
+) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(path_override) = path_override {
+        command.env("PATH", path_override);
+    }
+    command.output()
+}
+
+fn spawn_cmd_fallback(
+    program: &str,
+    args: &[OsString],
+    path_override: Option<&OsString>,
+) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new("cmd");
+    command.arg("/C").arg(program).args(args);
+    if let Some(path_override) = path_override {
+        command.env("PATH", path_override);
+    }
+    command.output()
+}
+
+fn repair_script_path_entries() -> Result<Vec<PathBuf>, GuardianError> {
+    let mut entries = Vec::new();
+    if let Some(app_data) = env::var_os("APPDATA") {
+        entries.push(PathBuf::from(app_data).join("npm"));
+    }
+    if let Ok(package_root) = resolve_codex_package_root()
+        && let Some(npm_root) = package_root
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+    {
+        entries.push(npm_root.to_path_buf());
+    }
+    dedupe_paths(entries)
+}
+
+fn build_path_with_prepend(extra_paths: &[PathBuf]) -> Result<OsString, GuardianError> {
+    let mut merged = extra_paths.to_vec();
+    if let Some(existing) = env::var_os("PATH") {
+        merged.extend(env::split_paths(&existing));
+    }
+    env::join_paths(merged).map_err(|error| {
+        GuardianError::invalid_state(format!("failed to build PATH for Codex repair: {error}"))
+    })
+}
+
+fn resolve_codex_shim_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(app_data) = env::var_os("APPDATA") {
+        let npm_root = PathBuf::from(app_data).join("npm");
+        candidates.push(npm_root.join("codex.cmd"));
+        candidates.push(npm_root.join("codex"));
+    }
+    dedupe_paths(candidates)
+        .ok()?
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn render_repair_script_bootstrap(
+    script_path: &Path,
+    codex_home: &Path,
+    state_db_path: &Path,
+    target_version: Option<&str>,
+    codex_shim_path: Option<&Path>,
+) -> String {
+    let mut commands = Vec::new();
+    if let Some(codex_shim_path) = codex_shim_path {
+        let version_probe = format!("\"{}\" --version 2>nul", codex_shim_path.display());
+        commands.push(format!(
+            "function codex {{ param([Parameter(ValueFromRemainingArguments=$true)][string[]]$cliArgs); if ($cliArgs.Count -eq 1 -and $cliArgs[0] -eq '--version') {{ & cmd /d /c {} }} else {{ & {} @cliArgs }} }}",
+            quote_powershell_literal(version_probe),
+            quote_powershell_literal(codex_shim_path),
+        ));
+    }
+
+    let mut script_invocation = format!(
+        "& {} -CodexHome {} -StateDbPath {} -SkipInstall",
+        quote_powershell_literal(script_path),
+        quote_powershell_literal(codex_home),
+        quote_powershell_literal(state_db_path),
+    );
+    if let Some(target_version) = target_version {
+        script_invocation.push_str(" -TargetVersion ");
+        script_invocation.push_str(&quote_powershell_literal(target_version));
+    }
+    commands.push(script_invocation);
+
+    format!("& {{ {} }}", commands.join("; "))
+}
+
+fn quote_powershell_literal(value: impl AsRef<OsStr>) -> String {
+    let rendered = value.as_ref().to_string_lossy().replace('\'', "''");
+    format!("'{rendered}'")
 }
 
 fn decode_output(bytes: &[u8]) -> String {
@@ -924,9 +1087,10 @@ struct ProcessOutput {
 mod tests {
     use super::{
         ACTIVE_VERSION_PREFIX, BACKUP_PREFIX, CodexRepairExecution, CodexRepairOutcome,
-        CodexTrustRepair, REPAIR_PREFIX, active_version_from_output, backup_path_from_output,
-        command_with_project_path, ensure_hotfix_launcher_patch, hotfix_source_candidates,
-        normalize_repair_prefix, parse_semver_fragment,
+        CodexTrustRepair, EMBEDDED_REPAIR_SCRIPT, REPAIR_PREFIX, active_version_from_output,
+        backup_path_from_output, command_with_project_path, ensure_hotfix_launcher_patch,
+        ensure_repair_script_installed, hotfix_source_candidates, normalize_repair_prefix,
+        parse_semver_fragment, render_repair_script_bootstrap,
     };
     use std::path::{Path, PathBuf};
 
@@ -1050,9 +1214,7 @@ const binaryPath = existsSync(hotfixBinaryPath)
             outcome: CodexRepairOutcome::Repaired,
             trust_repair: Some(sample_trust_repair()),
             slow_path_repair: None,
-            slow_path_error: Some(
-                "unable to locate a verified Codex hotfix binary".to_string(),
-            ),
+            slow_path_error: Some("unable to locate a verified Codex hotfix binary".to_string()),
         };
         // Trust repair succeeded so the overall outcome stays `Repaired`; the
         // skip is reported as an evidence/note and does not downgrade prior work.
@@ -1064,8 +1226,10 @@ const binaryPath = existsSync(hotfixBinaryPath)
         );
         let notes = execution.notes();
         assert!(
-            notes.iter().any(|note| note.contains("slow-path launcher hotfix was skipped")
-                && note.contains("unable to locate a verified Codex hotfix binary")),
+            notes.iter().any(
+                |note| note.contains("slow-path launcher hotfix was skipped")
+                    && note.contains("unable to locate a verified Codex hotfix binary")
+            ),
             "notes must surface the slow-path skip reason: {notes:?}"
         );
 
@@ -1089,6 +1253,9 @@ const binaryPath = existsSync(hotfixBinaryPath)
         let candidates = hotfix_source_candidates(
             Path::new(r"C:\Users\Example\AppData\Roaming\npm\node_modules\@openai\codex"),
             Path::new(r"C:\Users\Example\AppData\Local\Temp"),
+            Some(Path::new(
+                r"D:\Workspaces\Guardian Project\dist\v0.1.0\vendor-hotfix",
+            )),
             "x86_64-pc-windows-msvc",
             "codex.exe",
         );
@@ -1100,9 +1267,78 @@ const binaryPath = existsSync(hotfixBinaryPath)
                     r"C:\Users\Example\AppData\Roaming\npm\node_modules\@openai\codex\vendor-hotfix\x86_64-pc-windows-msvc\codex\codex.exe"
                 ),
                 PathBuf::from(
+                    r"D:\Workspaces\Guardian Project\dist\v0.1.0\vendor-hotfix\x86_64-pc-windows-msvc\codex\codex.exe"
+                ),
+                PathBuf::from(
                     r"C:\Users\Example\AppData\Local\Temp\codex-src\codex-rs\target\release\codex.exe"
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn repair_script_bootstrap_injects_cmd_based_version_probe() {
+        let bootstrap = render_repair_script_bootstrap(
+            Path::new(r"C:\Users\Example\.codex\tools\repair-codex-resume.ps1"),
+            Path::new(r"C:\Users\Example\.codex"),
+            Path::new(r"C:\Users\Example\.codex\state_5.sqlite"),
+            Some("0.124.0"),
+            Some(Path::new(r"C:\Users\Example\AppData\Roaming\npm\codex.cmd")),
+        );
+
+        assert!(bootstrap.contains("function codex"));
+        assert!(bootstrap.contains("& cmd /d /c"));
+        assert!(bootstrap.contains("codex.cmd\" --version 2>nul"));
+        assert!(bootstrap.contains("-TargetVersion '0.124.0'"));
+    }
+
+    #[test]
+    fn embedded_repair_script_matches_runtime_contract() {
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.starts_with("[CmdletBinding()]"),
+            "embedded script must begin with the PowerShell binding header"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("[codex-resume-repair]"),
+            "embedded script must emit the audited prefix Guardian parses"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("$StateDbPath"),
+            "embedded script must accept the StateDbPath parameter"
+        );
+    }
+
+    #[test]
+    fn ensure_repair_script_installed_writes_when_missing() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let codex_home = temp.path();
+
+        let path = ensure_repair_script_installed(codex_home).expect("first install");
+
+        assert_eq!(
+            path,
+            codex_home.join("tools").join("repair-codex-resume.ps1")
+        );
+        let written = std::fs::read(&path).expect("read written script");
+        assert_eq!(written, EMBEDDED_REPAIR_SCRIPT.as_bytes());
+    }
+
+    #[test]
+    fn ensure_repair_script_installed_preserves_existing_content() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let codex_home = temp.path();
+        let custom_payload = b"# operator-customized repair script\n";
+        let tools_dir = codex_home.join("tools");
+        std::fs::create_dir_all(&tools_dir).expect("seed tools dir");
+        std::fs::write(tools_dir.join("repair-codex-resume.ps1"), custom_payload)
+            .expect("seed custom script");
+
+        let path = ensure_repair_script_installed(codex_home).expect("idempotent install");
+
+        let preserved = std::fs::read(&path).expect("read preserved script");
+        assert_eq!(
+            preserved, custom_payload,
+            "existing operator-owned script must not be overwritten"
         );
     }
 }

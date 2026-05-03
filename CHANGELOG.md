@@ -6,6 +6,50 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-03
+
+### Fixed
+
+- `guardian repair codex --confirm` no longer aborts with
+  `trusted repair script is missing: ...\.codex\tools\repair-codex-resume.ps1`
+  on a freshly-installed machine (GitHub issue #2). The trusted PowerShell
+  repair script is now embedded into `guardian.exe` via `include_str!` and
+  materialized to `<codex_home>/tools/repair-codex-resume.ps1` on first launch
+  (and defensively before the C2 repair branch). Existing operator-customised
+  scripts at that path are preserved.
+- The release zip again carries the slow-path Codex hotfix binary at
+  `vendor-hotfix/x86_64-pc-windows-msvc/codex/codex.exe` so C4 (slow-path
+  launcher) repair can run on machines that have never built Codex from
+  source. v0.1.1 silently dropped this asset whenever the maintainer's
+  `%TEMP%\codex-src\codex-rs\target\release\codex.exe` was missing.
+
+### Changed
+
+- `package-release.ps1` learned a multi-source hotfix discovery chain
+  (repo `vendor-hotfix/` cache → prior `dist/v*/` releases → npm-installed
+  `@openai/codex` package → `%TEMP%\codex-src` source build) plus a
+  `-HotfixSha256` integrity check (default
+  `927ece82f53d23383fc70b21d3b3c35fc024e0bfae76bc548f98f9295cad2c89`) and a
+  new `-HotfixBinary` override for explicit paths. When no candidate matches
+  the expected SHA256, the script now emits the full search list rather than
+  a generic warning.
+- The release zip also stages `tools/repair-codex-resume.ps1` as a
+  defense-in-depth copy so the script is observable even before Guardian has
+  ever run.
+
+### Added
+
+- `guardian-repair::codex::ensure_codex_tools_deployed` helper, called from
+  `apps/guardian/src/app.rs::run` so every CLI / GUI / tray entry point lays
+  down the bundled tools idempotently.
+- `apps/guardian/assets/tools/repair-codex-resume.ps1` is now the canonical
+  source of truth for the repair script and is shipped with the source tree.
+- `vendor-hotfix/` repo-root cache convention (gitignored) so maintainers can
+  stake a verified Codex hotfix `codex.exe` once and have every subsequent
+  `package-release.ps1` invocation pick it up deterministically.
+
+## [0.1.1] - 2026-04-23
+
 ### Fixed
 
 - `guardian repair codex --confirm` no longer aborts the entire run and discards
