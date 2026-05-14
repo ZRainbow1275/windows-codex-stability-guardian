@@ -28,12 +28,13 @@ use crate::{
 pub fn run(cli: Cli) -> Result<i32, GuardianError> {
     deploy_codex_tools_best_effort();
     match cli.command {
-        Command::Check(args) => handle_check(&cli.global, args),
-        Command::Repair(args) => handle_repair(&cli.global, args),
-        Command::Diagnose(args) => handle_diagnose(&cli.global, args),
-        Command::Export(args) => handle_export(&cli.global, args),
-        Command::Gui(args) => handle_gui(&cli.global, args),
-        Command::Tray(args) => handle_tray(&cli.global, args),
+        Some(Command::Check(args)) => handle_check(&cli.global, args),
+        Some(Command::Repair(args)) => handle_repair(&cli.global, args),
+        Some(Command::Diagnose(args)) => handle_diagnose(&cli.global, args),
+        Some(Command::Export(args)) => handle_export(&cli.global, args),
+        Some(Command::Gui(args)) => handle_gui(&cli.global, args),
+        Some(Command::Tray(args)) => handle_tray(&cli.global, args),
+        None => handle_default_command(&cli.global),
     }
 }
 
@@ -675,6 +676,16 @@ fn handle_gui(global: &GlobalArgs, _args: GuiArgs) -> Result<i32, GuardianError>
     }
 
     gui::run_gui()
+}
+
+fn handle_default_command(global: &GlobalArgs) -> Result<i32, GuardianError> {
+    if global.json || global.quiet || global.dry_run || global.confirm {
+        return Err(GuardianError::invalid_state(
+            "`guardian` without a subcommand opens the GUI and does not accept global execution flags; use an explicit subcommand such as `guardian --json check`",
+        ));
+    }
+
+    handle_gui(global, GuiArgs::default())
 }
 
 fn handle_tray(global: &GlobalArgs, _args: TrayArgs) -> Result<i32, GuardianError> {

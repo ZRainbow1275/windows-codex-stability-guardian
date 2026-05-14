@@ -164,8 +164,8 @@ if (-not (Test-Path -LiteralPath $GuardianExe)) {
 $process = $null
 
 try {
-    Write-Step "starting guardian gui"
-    $process = Start-Process -FilePath $GuardianExe -ArgumentList @("gui") -PassThru
+    Write-Step "starting guardian gui through default double-click entrypoint"
+    $process = Start-Process -FilePath $GuardianExe -PassThru
     $targetProcessId = [uint32]$process.Id
 
     $windowHandle = Wait-Until -Description "Guardian GUI main window" -TimeoutSeconds $StartupTimeoutSeconds -Condition {

@@ -167,14 +167,14 @@ impl TrayAction {
 
     fn args(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::RefreshStatus => Some(&["check", "--json"]),
+            Self::RefreshStatus => Some(&["--json", "check"]),
             Self::DiagnoseProfile => None,
-            Self::RepairCodexConfirm => Some(&["repair", "codex", "--confirm", "--json"]),
-            Self::RepairDockerConfirm => Some(&["repair", "docker", "--confirm", "--json"]),
-            Self::ExportBundle => Some(&["export", "bundle", "--json"]),
-            Self::ExportBundleZip => Some(&["export", "bundle", "--json", "--zip"]),
+            Self::RepairCodexConfirm => Some(&["--json", "repair", "codex", "--confirm"]),
+            Self::RepairDockerConfirm => Some(&["--json", "repair", "docker", "--confirm"]),
+            Self::ExportBundle => Some(&["--json", "export", "bundle"]),
+            Self::ExportBundleZip => Some(&["--json", "export", "bundle", "--zip"]),
             Self::ExportBundleZipRetain => {
-                Some(&["export", "bundle", "--json", "--zip", "--retain", "5"])
+                Some(&["--json", "export", "bundle", "--zip", "--retain", "5"])
             }
             Self::OpenLatestBundle
             | Self::OpenLatestBundleZip
@@ -1043,28 +1043,28 @@ mod tests {
     fn tray_actions_map_to_cli_arguments() {
         assert_eq!(
             TrayAction::RefreshStatus.args(),
-            Some(&["check", "--json"][..])
+            Some(&["--json", "check"][..])
         );
         assert_eq!(TrayAction::DiagnoseProfile.args(), None);
         assert_eq!(
             TrayAction::RepairCodexConfirm.args(),
-            Some(&["repair", "codex", "--confirm", "--json"][..])
+            Some(&["--json", "repair", "codex", "--confirm"][..])
         );
         assert_eq!(
             TrayAction::RepairDockerConfirm.args(),
-            Some(&["repair", "docker", "--confirm", "--json"][..])
+            Some(&["--json", "repair", "docker", "--confirm"][..])
         );
         assert_eq!(
             TrayAction::ExportBundle.args(),
-            Some(&["export", "bundle", "--json"][..])
+            Some(&["--json", "export", "bundle"][..])
         );
         assert_eq!(
             TrayAction::ExportBundleZip.args(),
-            Some(&["export", "bundle", "--json", "--zip"][..])
+            Some(&["--json", "export", "bundle", "--zip"][..])
         );
         assert_eq!(
             TrayAction::ExportBundleZipRetain.args(),
-            Some(&["export", "bundle", "--json", "--zip", "--retain", "5"][..])
+            Some(&["--json", "export", "bundle", "--zip", "--retain", "5"][..])
         );
         assert_eq!(TrayAction::OpenLatestBundle.args(), None);
         assert_eq!(TrayAction::OpenLatestBundleZip.args(), None);

@@ -272,24 +272,24 @@ impl GuiCommandSpec {
     fn build(action: GuiAction) -> Result<Self, GuardianError> {
         let spec = match action {
             GuiAction::RunCheck => Self {
-                args: vec![OsString::from("check"), OsString::from("--json")],
+                args: vec![OsString::from("--json"), OsString::from("check")],
                 profile_output: None,
             },
             GuiAction::RepairCodexConfirm => Self {
                 args: vec![
+                    OsString::from("--json"),
                     OsString::from("repair"),
                     OsString::from("codex"),
                     OsString::from("--confirm"),
-                    OsString::from("--json"),
                 ],
                 profile_output: None,
             },
             GuiAction::RepairDockerConfirm => Self {
                 args: vec![
+                    OsString::from("--json"),
                     OsString::from("repair"),
                     OsString::from("docker"),
                     OsString::from("--confirm"),
-                    OsString::from("--json"),
                 ],
                 profile_output: None,
             },
@@ -297,9 +297,9 @@ impl GuiCommandSpec {
                 let output = build_profile_diagnosis_output_path()?;
                 Self {
                     args: vec![
+                        OsString::from("--json"),
                         OsString::from("diagnose"),
                         OsString::from("profile"),
-                        OsString::from("--json"),
                         OsString::from("--output"),
                         output.as_os_str().to_os_string(),
                     ],
@@ -308,26 +308,26 @@ impl GuiCommandSpec {
             }
             GuiAction::ExportBundle => Self {
                 args: vec![
+                    OsString::from("--json"),
                     OsString::from("export"),
                     OsString::from("bundle"),
-                    OsString::from("--json"),
                 ],
                 profile_output: None,
             },
             GuiAction::ExportBundleZip => Self {
                 args: vec![
+                    OsString::from("--json"),
                     OsString::from("export"),
                     OsString::from("bundle"),
-                    OsString::from("--json"),
                     OsString::from("--zip"),
                 ],
                 profile_output: None,
             },
             GuiAction::ExportBundleZipRetain5 => Self {
                 args: vec![
+                    OsString::from("--json"),
                     OsString::from("export"),
                     OsString::from("bundle"),
-                    OsString::from("--json"),
                     OsString::from("--zip"),
                     OsString::from("--retain"),
                     OsString::from("5"),
@@ -3344,7 +3344,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             args,
-            vec!["export", "bundle", "--json", "--zip", "--retain", "5"]
+            vec!["--json", "export", "bundle", "--zip", "--retain", "5"]
         );
     }
 
@@ -3357,9 +3357,9 @@ mod tests {
             .as_deref()
             .expect("profile output path should exist");
 
-        assert_eq!(spec.args[0].to_string_lossy().as_ref(), "diagnose");
-        assert_eq!(spec.args[1].to_string_lossy().as_ref(), "profile");
-        assert_eq!(spec.args[2].to_string_lossy().as_ref(), "--json");
+        assert_eq!(spec.args[0].to_string_lossy().as_ref(), "--json");
+        assert_eq!(spec.args[1].to_string_lossy().as_ref(), "diagnose");
+        assert_eq!(spec.args[2].to_string_lossy().as_ref(), "profile");
         assert_eq!(spec.args[3].to_string_lossy().as_ref(), "--output");
         assert_eq!(Path::new(&spec.args[4]), output);
     }

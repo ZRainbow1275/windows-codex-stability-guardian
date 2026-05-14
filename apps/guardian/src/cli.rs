@@ -10,7 +10,7 @@ pub struct Cli {
     #[command(flatten)]
     pub global: GlobalArgs,
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -110,7 +110,7 @@ mod tests {
     fn parses_check_with_global_json_flag() {
         let cli = Cli::parse_from(["guardian", "check", "--json"]);
         assert!(cli.global.json);
-        assert!(matches!(cli.command, Command::Check(_)));
+        assert!(matches!(cli.command, Some(Command::Check(_))));
     }
 
     #[test]
@@ -119,10 +119,66 @@ mod tests {
         assert!(cli.global.dry_run);
         assert!(matches!(
             cli.command,
-            Command::Repair(super::RepairArgs {
+            Some(Command::Repair(super::RepairArgs {
                 target: RepairTarget::Codex(CodexRepairArgs { project_path: None })
-            })
+            }))
         ));
+    }
+
+    #[test]
+    fn parses_no_command_for_double_click_default_gui() {
+        let cli = Cli::parse_from(["guardian"]);
+        assert!(!cli.global.json);
+        assert!(!cli.global.dry_run);
+        assert!(!cli.global.confirm);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_no_command_with_global_flags_without_guessing_a_subcommand() {
+        let cli = Cli::parse_from(["guardian", "--json"]);
+        assert!(cli.global.json);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_nested_commands_with_global_json_prefix() {
+        let repair = Cli::parse_from(["guardian", "--json", "repair", "codex", "--confirm"]);
+        assert!(repair.global.json);
+        assert!(repair.global.confirm);
+        assert!(matches!(
+            repair.command,
+            Some(Command::Repair(super::RepairArgs {
+                target: RepairTarget::Codex(CodexRepairArgs { project_path: None })
+            }))
+        ));
+
+        let diagnose = Cli::parse_from([
+            "guardian",
+            "--json",
+            "diagnose",
+            "profile",
+            "--output",
+            "C:\\temp\\profile.json",
+        ]);
+        assert!(diagnose.global.json);
+        assert!(matches!(
+            diagnose.command,
+            Some(Command::Diagnose(super::DiagnoseArgs {
+                target: DiagnoseTarget::Profile(_)
+            }))
+        ));
+
+        let export = Cli::parse_from(["guardian", "--json", "export", "bundle", "--zip"]);
+        assert!(export.global.json);
+        match export.command {
+            Some(Command::Export(super::ExportArgs {
+                target: ExportTarget::Bundle(args),
+            })) => {
+                assert!(args.zip);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
@@ -137,9 +193,9 @@ mod tests {
         ]);
         assert!(cli.global.confirm);
         match cli.command {
-            Command::Repair(super::RepairArgs {
+            Some(Command::Repair(super::RepairArgs {
                 target: RepairTarget::Codex(args),
-            }) => {
+            })) => {
                 assert_eq!(
                     args.project_path.as_deref(),
                     Some(std::path::Path::new("D:\\Workspaces\\Inkforge"))
@@ -154,9 +210,9 @@ mod tests {
         let diagnose = Cli::parse_from(["guardian", "diagnose", "profile"]);
         assert!(matches!(
             diagnose.command,
-            Command::Diagnose(super::DiagnoseArgs {
+            Some(Command::Diagnose(super::DiagnoseArgs {
                 target: DiagnoseTarget::Profile(_)
-            })
+            }))
         ));
 
         let export = Cli::parse_from([
@@ -170,9 +226,9 @@ mod tests {
             "5",
         ]);
         match export.command {
-            Command::Export(super::ExportArgs {
+            Some(Command::Export(super::ExportArgs {
                 target: ExportTarget::Bundle(args),
-            }) => {
+            })) => {
                 assert!(args.zip);
                 assert_eq!(args.retain, Some(5));
                 assert_eq!(
@@ -187,6 +243,6 @@ mod tests {
     #[test]
     fn parses_gui_command() {
         let gui = Cli::parse_from(["guardian", "gui"]);
-        assert!(matches!(gui.command, Command::Gui(_)));
+        assert!(matches!(gui.command, Some(Command::Gui(_))));
     }
 }
