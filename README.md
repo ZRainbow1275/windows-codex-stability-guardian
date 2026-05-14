@@ -1,16 +1,47 @@
 # Windows Codex 稳定性守护工具（Windows Codex Stability Guardian）
 
-## 社区支持
-学 AI , 上 L 站
-
-[LinuxDO](https://linux.do/)
-
 [![CI](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/ci.yml)
 [![Release](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml/badge.svg)](https://github.com/ZRainbow1275/windows-codex-stability-guardian/actions/workflows/release.yml)
 
 面向 Windows 工作站的本地稳定性工具，覆盖 Codex CLI、Docker Desktop / WSL2、以及 Windows 用户配置文件三个常见故障域。
 
 Guardian 的目标只有一个：把 Codex / Docker / Profile 这一类**反复出现、根因在本地状态漂移**的小故障，变成可观察、可证据化、可在 `--confirm` 守护下安全修复的事项；其它无法分类的情况一律只报告、绝不动手。
+
+---
+
+## 当前状态
+
+| 项目 | 状态 |
+| --- | --- |
+| 发布线 | `v0.1.2` |
+| 打包产物 | 已修复：Release zip 内的 `guardian.exe` 可直接双击启动桌面 GUI |
+| 默认入口 | `guardian.exe` 无参数运行时进入桌面 GUI；CLI 子命令仍通过 `check` / `repair` / `diagnose` / `export` 显式调用 |
+| 已验证产物 | `dist/v0.1.2/guardian.exe` 无参 GUI smoke 通过，`cargo test --workspace` 与 `cargo clippy --workspace --all-targets -- -D warnings` 通过 |
+| 安全边界 | 只读诊断默认不写入；修复动作必须显式 `--confirm` |
+
+从 `v0.1.2` 起，过去“打包后双击 `guardian.exe` 一闪而过、不显示 GUI”的问题已经修复。原因是旧版本把无参启动当作 CLI 用法错误处理；现在无参入口会默认打开桌面 GUI，适合普通 Windows 用户从文件管理器直接启动。
+
+## 桌面 GUI 运行截图
+
+以下截图均来自真实打包产物 `dist/v0.1.2/guardian.exe`，通过无参数启动后截取。
+
+### 只读健康概览
+
+![Guardian GUI 健康概览](docs/assets/readme/guardian-gui-overview.png)
+
+### 诊断步骤
+
+![Guardian GUI 诊断步骤](docs/assets/readme/guardian-gui-diagnose.png)
+
+### 受保护的操作顺序
+
+![Guardian GUI 受保护操作提示](docs/assets/readme/guardian-gui-guarded-step.png)
+
+---
+
+## 社区支持
+
+学 AI，上 L 站：[LinuxDO](https://linux.do/)
 
 ---
 
