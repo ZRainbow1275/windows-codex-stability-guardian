@@ -5,6 +5,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::Local;
@@ -15,12 +16,13 @@ use guardian_windows::{
     paths::{codex_home_dir, guardian_backup_dir, latest_codex_state_db},
     process::run_command_with_cmd_fallback,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 const SCRIPT_OUTPUT_LIMIT: usize = 8;
 const REPAIR_PREFIX: &str = "[codex-resume-repair]";
 const BACKUP_PREFIX: &str = "SQLite backup:";
 const ACTIVE_VERSION_PREFIX: &str = "Repair complete. Active version:";
+const SESSION_ARCHIVE_GRACE_DAYS: i64 = 30;
 
 /// Trusted PowerShell repair script bundled into `guardian.exe`. The original lives at
 /// `apps/guardian/assets/tools/repair-codex-resume.ps1` and is materialized to
@@ -53,6 +55,9 @@ pub struct CodexRepairExecution {
     pub backup_path: Option<PathBuf>,
     pub stale_rows_before: Option<i64>,
     pub stale_rows_after: Option<i64>,
+    pub old_sessions_before: Option<i64>,
+    pub old_sessions_after: Option<i64>,
+    pub old_session_archive_days: Option<i64>,
     pub active_version: Option<String>,
     pub stdout_excerpt: Vec<String>,
     pub stderr_excerpt: Vec<String>,
@@ -101,9 +106,20 @@ impl CodexRepairExecution {
             (self.stale_rows_before, self.stale_rows_after),
             (Some(before), Some(after)) if before > 0 && after == 0
         );
+        let old_sessions_archived = matches!(
+            (self.old_sessions_before, self.old_sessions_after),
+            (Some(before), Some(after)) if before > after
+        );
+        let old_session_archive_incomplete = matches!(
+            (self.old_sessions_before, self.old_sessions_after),
+            (Some(before), Some(after)) if before > 0 && after > 0
+        );
         let mut repaired_steps = Vec::new();
         if stale_repaired {
             repaired_steps.push("cleared stale rows");
+        }
+        if old_sessions_archived {
+            repaired_steps.push("archived Codex sessions older than 30 days");
         }
         if trust_added {
             repaired_steps.push("appended missing trusted project entries");
@@ -114,19 +130,21 @@ impl CodexRepairExecution {
 
         match self.outcome {
             CodexRepairOutcome::Noop => {
-                "Codex repair confirm completed without changing stale rows, trust entries, or slow-path launcher state."
+                "Codex repair confirm completed without changing stale rows, 30-day session archive state, trust entries, or slow-path launcher state."
                     .to_string()
             }
             CodexRepairOutcome::Repaired => {
                 if repaired_steps.is_empty() {
-                    "Codex repair confirm completed without changing stale rows, trust entries, or slow-path launcher state."
+                    "Codex repair confirm completed without changing stale rows, 30-day session archive state, trust entries, or slow-path launcher state."
                         .to_string()
                 } else {
                     format!("Codex repair confirm {}.", repaired_steps.join(", "))
                 }
             }
             CodexRepairOutcome::Unresolved => {
-                let tail = if self.slow_path_error.is_some() {
+                let tail = if old_session_archive_incomplete {
+                    "but some sessions older than 30 days remained unarchived after verification."
+                } else if self.slow_path_error.is_some() {
                     "but the Codex slow-path launcher hotfix step was skipped due to an error (see notes)."
                 } else {
                     "but stale rows still remain after verification."
@@ -160,6 +178,20 @@ impl CodexRepairExecution {
                 "SQLite backup created at {}",
                 backup_path.display()
             ));
+        }
+        if let (Some(before), Some(after), Some(days)) = (
+            self.old_sessions_before,
+            self.old_sessions_after,
+            self.old_session_archive_days,
+        ) && before > 0
+        {
+            notes.push(format!(
+                "Codex session archive applied with a {days}-day retention window: old_unarchived_before={before}, old_unarchived_after={after}"
+            ));
+            notes.push(
+                "Existing `codex resume` processes were not stopped; restart the stuck picker to observe the refreshed session list."
+                    .to_string(),
+            );
         }
         if let Some(trust_repair) = &self.trust_repair {
             notes.push(format!(
@@ -239,13 +271,13 @@ pub fn planned_actions(project_path: Option<&Path>) -> Vec<ActionPlan> {
     vec![
         ActionPlan::new(
             dry_run,
-            "Preview the Codex repair chain, including trust recovery and slow-path launcher staging when those drifts are identified."
+            "Preview the Codex repair chain, including trust recovery, 30-day session archiving, and slow-path launcher staging when those drifts are identified."
                 .to_string(),
             false,
         ),
         ActionPlan::new(
             confirm,
-            "Execute the managed Codex repair chain with backup, verification, audit, and controlled slow-path launcher hotfix staging."
+            "Execute the managed Codex repair chain with backup, verification, audit, 30-day session archiving, and controlled slow-path launcher hotfix staging."
                 .to_string(),
             true,
         ),
@@ -257,8 +289,10 @@ pub fn execute_confirmed(
 ) -> Result<CodexRepairExecution, GuardianError> {
     let observer_report = codex_observer::observe_with_target(project_path)?;
     let repair_stale_rows = domain_has_failure_class(&observer_report, "C2");
-    let repair_slow_path =
-        domain_has_failure_class(&observer_report, "C4") || slow_path_repair_required();
+    let repair_old_sessions = domain_has_failure_class(&observer_report, "C4")
+        && domain_evidence_i64(&observer_report, "old_unarchived_threads")
+            .is_some_and(|count| count > 0);
+    let repair_slow_path = slow_path_repair_required();
     let trust_target = trust_target_from_report(&observer_report);
 
     let mut execution = CodexRepairExecution {
@@ -267,6 +301,9 @@ pub fn execute_confirmed(
         backup_path: None,
         stale_rows_before: None,
         stale_rows_after: None,
+        old_sessions_before: None,
+        old_sessions_after: None,
+        old_session_archive_days: None,
         active_version: None,
         stdout_excerpt: Vec::new(),
         stderr_excerpt: Vec::new(),
@@ -276,16 +313,8 @@ pub fn execute_confirmed(
         slow_path_error: None,
     };
 
-    if repair_stale_rows {
+    if repair_stale_rows || repair_old_sessions {
         let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
-        let script_path = ensure_repair_script_installed(&codex_home).map_err(GuardianError::Io)?;
-        if !script_path.exists() {
-            return Err(GuardianError::invalid_state(format!(
-                "trusted repair script is missing: {}",
-                script_path.display()
-            )));
-        }
-
         let state_db_path = latest_codex_state_db(&codex_home)
             .map_err(GuardianError::Io)?
             .ok_or_else(|| {
@@ -294,30 +323,66 @@ pub fn execute_confirmed(
                     codex_home.display()
                 ))
             })?;
+        execution.state_db_path = Some(state_db_path.clone());
 
-        let stale_rows_before = inspect_stale_rows(&state_db_path)?;
-        let target_version = current_codex_version();
-        let process_output = run_repair_script(
-            &script_path,
-            &codex_home,
-            &state_db_path,
-            target_version.as_deref(),
-        )?;
-        let stale_rows_after = inspect_stale_rows(&state_db_path)?;
+        if repair_stale_rows {
+            let script_path =
+                ensure_repair_script_installed(&codex_home).map_err(GuardianError::Io)?;
+            if !script_path.exists() {
+                return Err(GuardianError::invalid_state(format!(
+                    "trusted repair script is missing: {}",
+                    script_path.display()
+                )));
+            }
 
-        execution.script_path = Some(script_path);
-        execution.state_db_path = Some(state_db_path);
-        execution.backup_path = backup_path_from_output(&process_output.stdout);
-        execution.stale_rows_before = Some(stale_rows_before);
-        execution.stale_rows_after = Some(stale_rows_after);
-        execution.active_version = active_version_from_output(&process_output.stdout);
-        execution.stdout_excerpt = excerpt_lines(&process_output.stdout);
-        execution.stderr_excerpt = excerpt_lines(&process_output.stderr);
+            let stale_rows_before = inspect_stale_rows(&state_db_path)?;
+            let target_version = current_codex_version();
+            let process_output = run_repair_script(
+                &script_path,
+                &codex_home,
+                &state_db_path,
+                target_version.as_deref(),
+            )?;
+            let stale_rows_after = inspect_stale_rows(&state_db_path)?;
 
-        if stale_rows_after > 0 {
-            execution.outcome = CodexRepairOutcome::Unresolved;
-        } else if stale_rows_before > 0 {
-            execution.outcome = CodexRepairOutcome::Repaired;
+            execution.script_path = Some(script_path);
+            execution.backup_path = backup_path_from_output(&process_output.stdout);
+            execution.stale_rows_before = Some(stale_rows_before);
+            execution.stale_rows_after = Some(stale_rows_after);
+            execution.active_version = active_version_from_output(&process_output.stdout);
+            execution.stdout_excerpt = excerpt_lines(&process_output.stdout);
+            execution.stderr_excerpt = excerpt_lines(&process_output.stderr);
+
+            if stale_rows_after > 0 {
+                execution.outcome = CodexRepairOutcome::Unresolved;
+            } else if stale_rows_before > 0 {
+                execution.outcome = CodexRepairOutcome::Repaired;
+            }
+        }
+
+        if repair_old_sessions {
+            let old_sessions_before =
+                inspect_old_unarchived_sessions(&state_db_path, SESSION_ARCHIVE_GRACE_DAYS)?;
+            if old_sessions_before > 0 && execution.backup_path.is_none() {
+                execution.backup_path = Some(backup_state_db(
+                    &state_db_path,
+                    &codex_home.join("backups"),
+                    "pre-old-session-archive",
+                )?);
+            }
+            archive_old_sessions(&state_db_path, SESSION_ARCHIVE_GRACE_DAYS)?;
+            let old_sessions_after =
+                inspect_old_unarchived_sessions(&state_db_path, SESSION_ARCHIVE_GRACE_DAYS)?;
+
+            execution.old_sessions_before = Some(old_sessions_before);
+            execution.old_sessions_after = Some(old_sessions_after);
+            execution.old_session_archive_days = Some(SESSION_ARCHIVE_GRACE_DAYS);
+
+            if old_sessions_after > 0 && old_sessions_before > 0 {
+                execution.outcome = CodexRepairOutcome::Unresolved;
+            } else if old_sessions_before > old_sessions_after {
+                execution.outcome = CodexRepairOutcome::Repaired;
+            }
         }
     }
 
@@ -397,6 +462,102 @@ fn inspect_stale_rows(path: &Path) -> Result<i64, GuardianError> {
         .map_err(|error| GuardianError::invalid_state(format!("stale row query failed: {error}")))
 }
 
+fn inspect_old_unarchived_sessions(path: &Path, days: i64) -> Result<i64, GuardianError> {
+    let connection = Connection::open(path)
+        .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
+    let archive_cutoff = archive_cutoff_epoch(days);
+    connection
+        .query_row(
+            "select count(*) from threads where archived = 0 and created_at < ?1",
+            [archive_cutoff],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("old session archive query failed: {error}"))
+        })
+}
+
+fn archive_old_sessions(path: &Path, days: i64) -> Result<usize, GuardianError> {
+    let mut connection = Connection::open(path)
+        .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("sqlite busy timeout failed: {error}"))
+        })?;
+
+    let archive_cutoff = archive_cutoff_epoch(days);
+    let archived_at = current_epoch_seconds();
+    let transaction = connection.transaction().map_err(|error| {
+        GuardianError::invalid_state(format!("sqlite transaction failed: {error}"))
+    })?;
+    let changed = transaction
+        .execute(
+            "update threads set archived = 1, archived_at = ?1 where archived = 0 and created_at < ?2",
+            params![archived_at, archive_cutoff],
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("old session archive update failed: {error}"))
+        })?;
+    transaction
+        .commit()
+        .map_err(|error| GuardianError::invalid_state(format!("sqlite commit failed: {error}")))?;
+    Ok(changed)
+}
+
+fn backup_state_db(
+    state_db_path: &Path,
+    backup_root: &Path,
+    reason: &str,
+) -> Result<PathBuf, GuardianError> {
+    fs::create_dir_all(backup_root)?;
+    let state_db_file_name = state_db_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("state.sqlite");
+    let backup_path = backup_root.join(format!(
+        "{}.{}-{}.bak",
+        state_db_file_name,
+        reason,
+        Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let connection = Connection::open(state_db_path)
+        .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("sqlite busy timeout failed: {error}"))
+        })?;
+    let backup_target = backup_path.display().to_string();
+    connection
+        .execute(
+            &format!("VACUUM main INTO {}", quote_sqlite_literal(&backup_target)),
+            [],
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!(
+                "sqlite backup failed for `{}`: {error}",
+                state_db_path.display()
+            ))
+        })?;
+    Ok(backup_path)
+}
+
+fn archive_cutoff_epoch(days: i64) -> i64 {
+    current_epoch_seconds().saturating_sub(days.saturating_mul(86_400))
+}
+
+fn current_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn quote_sqlite_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn run_repair_script(
     script_path: &Path,
     codex_home: &Path,
@@ -454,6 +615,10 @@ fn domain_evidence_value<'a>(
         .iter()
         .find(|item| item.key == key)
         .map(|item| item.value.as_str())
+}
+
+fn domain_evidence_i64(report: &guardian_core::types::DomainReport, key: &str) -> Option<i64> {
+    domain_evidence_value(report, key)?.trim().parse().ok()
 }
 
 #[derive(Debug, Clone)]
@@ -1208,6 +1373,9 @@ const binaryPath = existsSync(hotfixBinaryPath)
             backup_path: None,
             stale_rows_before: None,
             stale_rows_after: None,
+            old_sessions_before: None,
+            old_sessions_after: None,
+            old_session_archive_days: None,
             active_version: None,
             stdout_excerpt: Vec::new(),
             stderr_excerpt: Vec::new(),

@@ -386,14 +386,14 @@ pub(crate) fn localized_report_note(note: &str) -> String {
 
 pub(crate) fn localized_action_description(description: &str) -> String {
     match description {
-        "Preview the Codex repair chain, including trust recovery and slow-path launcher staging when those drifts are identified." =>
+        "Preview the Codex repair chain, including trust recovery, 30-day session archiving, and slow-path launcher staging when those drifts are identified." =>
         {
-            "先预览 Codex 修复链路；如果识别到 trust drift 或 slow-path 漂移，也会一并展示对应恢复计划。"
+            "先预览 Codex 修复链路；如果识别到 trust drift、30 天 session 归档或 slow-path 漂移，也会一并展示对应恢复计划。"
                 .to_string()
         }
-        "Execute the managed Codex repair chain with backup, verification, audit, and controlled slow-path launcher hotfix staging." =>
+        "Execute the managed Codex repair chain with backup, verification, audit, 30-day session archiving, and controlled slow-path launcher hotfix staging." =>
         {
-            "执行托管 Codex 修复链，并完成备份、写后验证、审计，以及受控 slow-path launcher hotfix 布置。"
+            "执行托管 Codex 修复链，并完成备份、写后验证、审计、30 天 session 归档，以及受控 slow-path launcher hotfix 布置。"
                 .to_string()
         }
         "Preview the Docker and WSL recovery chain." => {
@@ -428,10 +428,33 @@ fn localized_codex_summary(summary: &str) -> String {
         return "缺少 Codex 主目录，因此无法采集本机 Codex 证据。".to_string();
     }
     if summary
-        == "Codex repair confirm completed without changing stale rows, trust entries, or slow-path launcher state."
+        == "Codex repair confirm completed without changing stale rows, 30-day session archive state, trust entries, or slow-path launcher state."
     {
-        return "Codex 确认修复已执行，但本次没有改动 stale rows、trust 条目或 slow-path launcher 状态。"
+        return "Codex 确认修复已执行，但本次没有改动 stale rows、30 天 session 归档状态、trust 条目或 slow-path launcher 状态。"
             .to_string();
+    }
+    if let Some(details) = summary.strip_prefix("Codex repair confirm ")
+        && let Some(details) = details.strip_suffix(
+            ", but some sessions older than 30 days remained unarchived after verification.",
+        )
+    {
+        let translated = details
+            .replace("cleared stale rows", "清除了 stale rows")
+            .replace(
+                "archived Codex sessions older than 30 days",
+                "归档了 30 天以前的 Codex sessions",
+            )
+            .replace(
+                "appended missing trusted project entries",
+                "补齐了缺失的 trusted project 条目",
+            )
+            .replace(
+                "staged the Codex slow-path launcher hotfix",
+                "布置了 Codex slow-path launcher hotfix",
+            );
+        return format!(
+            "Codex 确认修复已执行：{translated}，但仍有 30 天以前的 sessions 未完成归档。"
+        );
     }
     if let Some(details) = summary.strip_prefix("Codex repair confirm ")
         && let Some(details) =
@@ -439,6 +462,10 @@ fn localized_codex_summary(summary: &str) -> String {
     {
         let translated = details
             .replace("cleared stale rows", "清除了 stale rows")
+            .replace(
+                "archived Codex sessions older than 30 days",
+                "归档了 30 天以前的 Codex sessions",
+            )
             .replace(
                 "appended missing trusted project entries",
                 "补齐了缺失的 trusted project 条目",
@@ -455,6 +482,10 @@ fn localized_codex_summary(summary: &str) -> String {
     {
         let translated = details
             .replace("cleared stale rows", "清除了 stale rows")
+            .replace(
+                "archived Codex sessions older than 30 days",
+                "归档了 30 天以前的 Codex sessions",
+            )
             .replace(
                 "appended missing trusted project entries",
                 "补齐了缺失的 trusted project 条目",
@@ -571,15 +602,15 @@ mod tests {
     fn translates_managed_codex_action_descriptions() {
         assert_eq!(
             localized_action_description(
-                "Preview the Codex repair chain, including trust recovery and slow-path launcher staging when those drifts are identified."
+                "Preview the Codex repair chain, including trust recovery, 30-day session archiving, and slow-path launcher staging when those drifts are identified."
             ),
-            "先预览 Codex 修复链路；如果识别到 trust drift 或 slow-path 漂移，也会一并展示对应恢复计划。"
+            "先预览 Codex 修复链路；如果识别到 trust drift、30 天 session 归档或 slow-path 漂移，也会一并展示对应恢复计划。"
         );
         assert_eq!(
             localized_action_description(
-                "Execute the managed Codex repair chain with backup, verification, audit, and controlled slow-path launcher hotfix staging."
+                "Execute the managed Codex repair chain with backup, verification, audit, 30-day session archiving, and controlled slow-path launcher hotfix staging."
             ),
-            "执行托管 Codex 修复链，并完成备份、写后验证、审计，以及受控 slow-path launcher hotfix 布置。"
+            "执行托管 Codex 修复链，并完成备份、写后验证、审计、30 天 session 归档，以及受控 slow-path launcher hotfix 布置。"
         );
     }
 }

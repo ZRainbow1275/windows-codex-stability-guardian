@@ -125,6 +125,36 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                         stale_rows_after.to_string(),
                     ));
             }
+            if let Some(days) = execution.old_session_archive_days {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_old_session_archive_days",
+                        days.to_string(),
+                    ));
+            }
+            if let Some(old_sessions_before) = execution.old_sessions_before {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_old_sessions_before",
+                        old_sessions_before.to_string(),
+                    ));
+            }
+            if let Some(old_sessions_after) = execution.old_sessions_after {
+                report
+                    .domains
+                    .codex
+                    .evidence
+                    .push(guardian_core::types::EvidenceItem::new(
+                        "repair_old_sessions_after",
+                        old_sessions_after.to_string(),
+                    ));
+            }
             report
                 .domains
                 .codex
@@ -715,6 +745,9 @@ fn persist_codex_repair_audit(
             .map(|path| path.display().to_string()),
         stale_rows_before: execution.stale_rows_before,
         stale_rows_after: execution.stale_rows_after,
+        old_sessions_before: execution.old_sessions_before,
+        old_sessions_after: execution.old_sessions_after,
+        old_session_archive_days: execution.old_session_archive_days,
         active_version: execution.active_version.clone(),
         backup_path: execution
             .backup_path

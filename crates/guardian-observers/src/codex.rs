@@ -3,6 +3,7 @@ use std::{
     io::SeekFrom,
     io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use guardian_core::{
@@ -18,6 +19,9 @@ use guardian_windows::{
     process::{CommandOutput, run_command_with_cmd_fallback},
 };
 use rusqlite::Connection;
+
+const SESSION_ARCHIVE_GRACE_DAYS: i64 = 30;
+const RESUME_STUCK_THRESHOLD: Duration = Duration::from_secs(60);
 
 pub fn observe() -> Result<DomainReport, GuardianError> {
     observe_with_target(None)
@@ -99,15 +103,38 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
             latest_state.display().to_string(),
         ));
         match inspect_state_db(&latest_state) {
-            Ok((thread_count, stale_rows)) => {
-                evidence.push(EvidenceItem::new("threads_total", thread_count.to_string()));
-                evidence.push(EvidenceItem::new("stale_rows", stale_rows.to_string()));
-                if stale_rows > 0 {
+            Ok(stats) => {
+                evidence.push(EvidenceItem::new(
+                    "threads_total",
+                    stats.thread_count.to_string(),
+                ));
+                evidence.push(EvidenceItem::new(
+                    "stale_rows",
+                    stats.stale_rows.to_string(),
+                ));
+                evidence.push(EvidenceItem::new(
+                    "session_archive_grace_days",
+                    SESSION_ARCHIVE_GRACE_DAYS.to_string(),
+                ));
+                evidence.push(EvidenceItem::new(
+                    "old_unarchived_threads",
+                    stats.old_unarchived_threads.to_string(),
+                ));
+                if stats.stale_rows > 0 {
                     status = StatusLevel::Warn;
                     failure_classes.push(FailureClass::C2);
                     notes.push(
                         "Detected stale rows in the latest Codex state database.".to_string(),
                     );
+                }
+                if stats.old_unarchived_threads > 0 {
+                    status = StatusLevel::Warn;
+                    failure_classes.push(FailureClass::C4);
+                    notes.push(format!(
+                        "Detected {} Codex thread(s) older than {} days that are still unarchived; they can be archived safely and may contribute to `/resume` slow-path.",
+                        stats.old_unarchived_threads,
+                        SESSION_ARCHIVE_GRACE_DAYS
+                    ));
                 }
             }
             Err(error) => {
@@ -121,6 +148,43 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
     } else {
         status = StatusLevel::Warn;
         notes.push("No `state_*.sqlite` file was found under `.codex`.".to_string());
+    }
+
+    match collect_codex_resume_process_signals() {
+        Ok(process_signals) => {
+            evidence.push(EvidenceItem::new(
+                "resume_process_count",
+                process_signals.observations.len().to_string(),
+            ));
+            evidence.push(EvidenceItem::new(
+                "resume_stuck_threshold_seconds",
+                RESUME_STUCK_THRESHOLD.as_secs().to_string(),
+            ));
+            if !process_signals.observations.is_empty() {
+                evidence.push(EvidenceItem::new(
+                    "resume_process_oldest_age_seconds",
+                    process_signals.oldest_age_seconds().to_string(),
+                ));
+                evidence.push(EvidenceItem::new(
+                    "resume_process_pids",
+                    process_signals.pid_summary(),
+                ));
+            }
+            let stuck_count = process_signals.stuck_count();
+            if stuck_count > 0 {
+                status = StatusLevel::Warn;
+                failure_classes.push(FailureClass::C4);
+                notes.push(format!(
+                    "Detected {stuck_count} long-running `codex resume` process(es); oldest age is {} seconds, which matches the `/resume` slow-path classifier.",
+                    process_signals.oldest_age_seconds()
+                ));
+            }
+        }
+        Err(error) => {
+            notes.push(format!(
+                "Unable to inspect running `codex resume` processes: {error}"
+            ));
+        }
     }
 
     let log_signals = collect_codex_log_signals()?;
@@ -275,7 +339,7 @@ fn count_session_files(root: &Path) -> Result<usize, GuardianError> {
     Ok(count)
 }
 
-fn inspect_state_db(path: &Path) -> Result<(i64, i64), GuardianError> {
+fn inspect_state_db(path: &Path) -> Result<CodexStateDbStats, GuardianError> {
     let connection = Connection::open(path)
         .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
     let thread_count: i64 = connection
@@ -288,7 +352,82 @@ fn inspect_state_db(path: &Path) -> Result<(i64, i64), GuardianError> {
             |row| row.get(0),
         )
         .map_err(|error| GuardianError::invalid_state(format!("stale row query failed: {error}")))?;
-    Ok((thread_count, stale_rows))
+    let archive_cutoff = archive_cutoff_epoch(SESSION_ARCHIVE_GRACE_DAYS);
+    let old_unarchived_threads: i64 = connection
+        .query_row(
+            "select count(*) from threads where archived = 0 and created_at < ?1",
+            [archive_cutoff],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("old unarchived thread query failed: {error}"))
+        })?;
+    Ok(CodexStateDbStats {
+        thread_count,
+        stale_rows,
+        old_unarchived_threads,
+    })
+}
+
+fn archive_cutoff_epoch(days: i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    now.saturating_sub(days.saturating_mul(86_400))
+}
+
+fn collect_codex_resume_process_signals() -> Result<CodexResumeProcessSignals, GuardianError> {
+    if !cfg!(target_os = "windows") {
+        return Ok(CodexResumeProcessSignals::default());
+    }
+
+    let output = command_output(
+        "powershell",
+        ["-NoProfile", "-Command", RESUME_PROCESS_PROBE],
+    )?;
+    Ok(parse_resume_process_signals(&output))
+}
+
+const RESUME_PROCESS_PROBE: &str = r#"
+$now = Get-Date
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.CommandLine -and
+        ($_.Name -eq "codex.exe" -or $_.Name -eq "node.exe") -and
+        ($_.CommandLine -match "(?i)codex(\.exe|\.js)?|@openai[\\/]+codex") -and
+        ($_.CommandLine -match "(?i)(^|\s)resume(\s|$)")
+    } |
+    Sort-Object CreationDate |
+    ForEach-Object {
+        $ageSeconds = [int][Math]::Floor(($now - $_.CreationDate).TotalSeconds)
+        $commandLine = ($_.CommandLine -replace "[\r\n\t]+", " ").Trim()
+        "{0}`t{1}`t{2}" -f $_.ProcessId, $ageSeconds, $commandLine
+    }
+"#;
+
+fn parse_resume_process_signals(output: &str) -> CodexResumeProcessSignals {
+    let observations = output
+        .lines()
+        .filter_map(parse_resume_process_observation)
+        .collect();
+    CodexResumeProcessSignals { observations }
+}
+
+fn parse_resume_process_observation(line: &str) -> Option<CodexResumeProcessObservation> {
+    let mut parts = line.splitn(3, '\t');
+    let pid = parts.next()?.trim().parse().ok()?;
+    let age_seconds = parts.next()?.trim().parse().ok()?;
+    let command_line = parts.next()?.trim().to_string();
+    if command_line.is_empty() {
+        return None;
+    }
+
+    Some(CodexResumeProcessObservation {
+        pid,
+        age_seconds,
+        command_line,
+    })
 }
 
 fn command_output_to_string(
@@ -396,6 +535,8 @@ fn is_codex_log_signal(line: &str) -> bool {
 fn looks_like_tooling_echo(line: &str) -> bool {
     line.starts_with('+')
         || line.starts_with('-')
+        || line.contains("MCP server stderr")
+        || line.contains("MCP server stdout")
         || line.contains("ToolCall:")
         || line.contains("exec_command")
         || line.contains("apply_patch")
@@ -478,6 +619,58 @@ struct CodexLogSignals {
 }
 
 #[derive(Debug, Clone)]
+struct CodexStateDbStats {
+    thread_count: i64,
+    stale_rows: i64,
+    old_unarchived_threads: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexResumeProcessSignals {
+    observations: Vec<CodexResumeProcessObservation>,
+}
+
+impl CodexResumeProcessSignals {
+    fn stuck_count(&self) -> usize {
+        self.observations
+            .iter()
+            .filter(|process| process.age_seconds >= RESUME_STUCK_THRESHOLD.as_secs())
+            .count()
+    }
+
+    fn oldest_age_seconds(&self) -> u64 {
+        self.observations
+            .iter()
+            .map(|process| process.age_seconds)
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn pid_summary(&self) -> String {
+        self.observations
+            .iter()
+            .take(6)
+            .map(|process| {
+                format!(
+                    "{}:{}s:{}",
+                    process.pid,
+                    process.age_seconds,
+                    trim_log_line(&process.command_line)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexResumeProcessObservation {
+    pid: u32,
+    age_seconds: u64,
+    command_line: String,
+}
+
+#[derive(Debug, Clone)]
 struct TrustTarget {
     path: PathBuf,
     source: &'static str,
@@ -506,7 +699,10 @@ fn resolve_trust_target(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{extract_trust_warning_path, is_trust_warning_signal, last_unique};
+    use super::{
+        CodexResumeProcessObservation, extract_trust_warning_path, is_codex_log_signal,
+        is_trust_warning_signal, last_unique, parse_resume_process_signals,
+    };
 
     #[test]
     fn trust_warning_signal_extracts_project_path() {
@@ -536,5 +732,27 @@ mod tests {
             last_unique(lines, 3),
             vec!["b".to_string(), "a".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn loading_sessions_from_mcp_tool_output_is_not_a_log_signal() {
+        let line = "2026-05-14T13:56:46.830415Z  INFO codex_rmcp_client::stdio_server_launcher: MCP server stderr (cmd): │ true TUI 会长时间停在 Loading sessions... 超过 1 分钟 │";
+        assert!(!is_codex_log_signal(line));
+    }
+
+    #[test]
+    fn parses_resume_process_observations() {
+        let output = "16092\t4210\tC:\\Users\\Example\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe resume\n";
+        let signals = parse_resume_process_signals(output);
+        assert_eq!(signals.observations.len(), 1);
+        assert_eq!(
+            signals.observations[0],
+            CodexResumeProcessObservation {
+                pid: 16092,
+                age_seconds: 4210,
+                command_line: "C:\\Users\\Example\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe resume".to_string()
+            }
+        );
+        assert_eq!(signals.stuck_count(), 1);
     }
 }
