@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn parser_only_collects_trusted_project_entries() {
         let keys = trusted_project_lookup_keys(
-            "[projects.\"d:\\\\desktop\\\\inkforge\"]\ntrust_level = \"trusted\"\n\n[projects.\"D:\\\\Desktop\\\\Other\"]\ntrust_level = \"ask\"\n",
+            "[projects.\"d:\\\\workspaces\\\\inkforge\"]\ntrust_level = \"trusted\"\n\n[projects.\"D:\\\\Workspaces\\\\Other\"]\ntrust_level = \"ask\"\n",
         )
         .expect("parse trusted keys");
 
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn missing_keys_ignore_existing_trusted_entries() {
         let missing = missing_project_trust_keys(
-            "[projects.\"d:\\\\desktop\\\\inkforge\"]\ntrust_level = \"trusted\"\n",
+            "[projects.\"d:\\\\workspaces\\\\inkforge\"]\ntrust_level = \"trusted\"\n",
             Path::new(r"D:\Workspaces\Inkforge"),
         )
         .expect("compute missing keys");
@@ -271,8 +271,8 @@ mod tests {
             ],
         );
 
-        assert!(rendered.contains("[projects.\"d:\\\\desktop\\\\inkforge\"]"));
-        assert!(rendered.contains("[projects.\"\\\\\\\\?\\\\d:\\\\desktop\\\\inkforge\"]"));
+        assert!(rendered.contains("[projects.\"d:\\\\workspaces\\\\inkforge\"]"));
+        assert!(rendered.contains("[projects.\"\\\\\\\\?\\\\d:\\\\workspaces\\\\inkforge\"]"));
         assert!(rendered.contains("trust_level = \"trusted\""));
     }
 }
