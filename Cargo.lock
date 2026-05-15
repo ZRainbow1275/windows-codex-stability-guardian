@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "guardian"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "clap",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-observers"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "guardian-core",
  "guardian-windows",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-repair"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "guardian-core",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-windows"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "quick-xml 0.38.4",
 ]

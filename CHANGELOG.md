@@ -6,6 +6,23 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-15
+
+### Fixed
+
+- Packaged `guardian.exe` is now usable as a Windows desktop application when
+  launched from File Explorer. Running `guardian.exe` with no subcommand now
+  opens the desktop GUI instead of printing CLI usage and exiting immediately.
+- JSON automation remains explicit: `guardian.exe --json` without a subcommand
+  reports an invalid invocation instead of guessing a GUI entry point.
+- GUI and tray internal command execution now use the supported
+  `--json <subcommand>` argument order.
+
+### Documentation
+
+- README now calls out the fixed packaged-artifact behavior and includes real
+  GUI screenshots captured from the packaged executable.
+
 ## [0.1.2] - 2026-05-03
 
 Guardian assumes the user has already installed `@openai/codex` via npm
