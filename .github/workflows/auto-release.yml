@@ -1,0 +1,162 @@
+name: auto-release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/auto-release.yml
+      - apps/guardian/scripts/package-release.ps1
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, with or without leading v. Defaults to the workspace package version."
+        required: false
+      reupload_existing:
+        description: "Re-upload assets for an existing release tag."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          $requested = "${{ github.event.inputs.version }}"
+
+          if ([string]::IsNullOrWhiteSpace($requested)) {
+            $metadataJson = cargo metadata --no-deps --format-version 1
+            $metadata = $metadataJson | ConvertFrom-Json
+            $guardian = $metadata.packages | Where-Object { $_.name -eq "guardian" } | Select-Object -First 1
+            if (-not $guardian) {
+              throw "Unable to resolve guardian package metadata."
+            }
+            $version = [string]$guardian.version
+          } else {
+            $version = $requested.Trim()
+            if ($version.StartsWith("v")) {
+              $version = $version.Substring(1)
+            }
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+([-.+][0-9A-Za-z.-]+)?$') {
+            throw "Invalid release version: $version"
+          }
+
+          $tag = "v$version"
+          git fetch --tags --force
+
+          $tagExists = $false
+          git rev-parse -q --verify "refs/tags/$tag" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $tagExists = $true
+          }
+
+          $releaseExists = $false
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $releaseExists = $true
+          }
+
+          $reuploadExisting = "${{ github.event.inputs.reupload_existing }}" -eq "true"
+          $skip = $tagExists -and $releaseExists -and -not $reuploadExisting
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "tag_exists=$tagExists" >> $env:GITHUB_OUTPUT
+          "release_exists=$releaseExists" >> $env:GITHUB_OUTPUT
+          "skip=$skip" >> $env:GITHUB_OUTPUT
+          "reupload_existing=$reuploadExisting" >> $env:GITHUB_OUTPUT
+
+          if ($skip) {
+            Write-Host "Release $tag already exists; skipping."
+          } else {
+            Write-Host "Preparing release $tag."
+          }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Stop when release already exists
+        if: steps.version.outputs.skip == 'True'
+        shell: pwsh
+        run: Write-Host "No release work required for ${{ steps.version.outputs.tag }}."
+
+      - name: Package release
+        if: steps.version.outputs.skip != 'True'
+        shell: pwsh
+        run: .\apps\guardian\scripts\package-release.ps1 -Version "${{ steps.version.outputs.tag }}"
+
+      - name: Create tag
+        if: steps.version.outputs.skip != 'True' && steps.version.outputs.tag_exists != 'True'
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}" "${{ github.sha }}"
+          git push origin "refs/tags/${{ steps.version.outputs.tag }}"
+
+      - name: Write release notes
+        if: steps.version.outputs.skip != 'True'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $notes = @"
+          ## Download for Windows users
+
+          Download **``guardian-$tag-windows-x64.zip``** from Assets. This is the complete Windows package and includes ``guardian.exe``, documentation, license, and the trusted repair script.
+
+          ``SHA256SUMS.txt`` is only for checking the recommended zip.
+
+          Do **not** download ``Source code (zip)`` or ``Source code (tar.gz)`` unless you want to build from source. GitHub adds those two source archives automatically for every tagged release; they are not runnable Windows packages.
+
+          ## Release automation
+
+          This release was produced by the automatic version-based release workflow.
+          "@
+          $notes = $notes -replace '^\s{10}', ''
+          Set-Content -LiteralPath release-notes.md -Value $notes -Encoding utf8
+
+      - name: Create or update GitHub Release
+        if: steps.version.outputs.skip != 'True'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $assetDir = Join-Path "dist" $tag
+          $zipPath = Join-Path $assetDir ("guardian-$tag-windows-x64.zip")
+          $checksumPath = Join-Path $assetDir "SHA256SUMS.txt"
+
+          if ("${{ steps.version.outputs.release_exists }}" -eq "True") {
+            gh release upload $tag $zipPath $checksumPath --clobber
+          } else {
+            gh release create $tag $zipPath $checksumPath --title $tag --notes-file release-notes.md --latest --target "${{ github.sha }}"
+          }
+        env:
+          GH_TOKEN: ${{ github.token }}

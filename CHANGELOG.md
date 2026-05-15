@@ -6,11 +6,21 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-15
+
+### Added
+
+- Version-based auto-release workflow. When the workspace package version is
+  bumped on `main` and the corresponding `vX.Y.Z` tag does not exist yet, CI
+  builds the Windows package, creates the tag, and publishes the release.
+
 ### Changed
 
 - Release workflow now uploads a single recommended Windows zip plus
   `SHA256SUMS.txt`; the standalone `guardian.exe` direct asset is no longer
   uploaded to avoid confusing it with the complete Windows package.
+- Windows-path test fixtures now use neutral example paths rather than local
+  workstation paths.
 
 ## [0.1.3] - 2026-05-15
 
