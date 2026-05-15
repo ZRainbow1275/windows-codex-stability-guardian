@@ -73,16 +73,23 @@ jobs:
 
           $tag = "v$version"
           git fetch --tags --force
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to fetch release tags."
+          }
 
           $tagExists = $false
           git rev-parse -q --verify "refs/tags/$tag" *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $tagProbeExit = $LASTEXITCODE
+          if ($tagProbeExit -eq 0) {
             $tagExists = $true
+          } elseif ($tagProbeExit -ne 1) {
+            throw "Failed to probe tag $tag."
           }
 
           $releaseExists = $false
           gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseProbeExit = $LASTEXITCODE
+          if ($releaseProbeExit -eq 0) {
             $releaseExists = $true
           }
 
@@ -101,6 +108,8 @@ jobs:
           } else {
             Write-Host "Preparing release $tag."
           }
+
+          exit 0
         env:
           GH_TOKEN: ${{ github.token }}
 
