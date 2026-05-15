@@ -31,5 +31,4 @@ jobs:
         with:
           files: |
             dist/${{ github.ref_name }}/guardian-${{ github.ref_name }}-windows-x64.zip
-            dist/${{ github.ref_name }}/guardian.exe
             dist/${{ github.ref_name }}/SHA256SUMS.txt

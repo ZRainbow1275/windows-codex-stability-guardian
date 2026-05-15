@@ -6,6 +6,12 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+
+- Release workflow now uploads a single recommended Windows zip plus
+  `SHA256SUMS.txt`; the standalone `guardian.exe` direct asset is no longer
+  uploaded to avoid confusing it with the complete Windows package.
+
 ## [0.1.3] - 2026-05-15
 
 ### Fixed

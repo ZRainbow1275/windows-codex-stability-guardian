@@ -93,15 +93,12 @@ try {
 
     Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
 
-    $checksumPath = Write-ChecksumFile -ArtifactDirectory $artifactRoot -Files @(
-        (Join-Path $artifactRoot "guardian.exe"),
-        $zipPath
-    )
+    $checksumPath = Write-ChecksumFile -ArtifactDirectory $artifactRoot -Files @($zipPath)
 
     Write-Host "Packaged release assets:"
     Write-Host "  Version: $Version"
-    Write-Host "  EXE: $(Join-Path $artifactRoot 'guardian.exe')"
-    Write-Host "  ZIP: $zipPath"
+    Write-Host "  Local smoke EXE: $(Join-Path $artifactRoot 'guardian.exe')"
+    Write-Host "  Release ZIP: $zipPath"
     Write-Host "  Checksums: $checksumPath"
 }
 finally {
