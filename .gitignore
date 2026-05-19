@@ -11,9 +11,11 @@
 /.trellis/
 /prompts/
 /AGENTS.md
+/CLAUDE.md
 /specs/
 
 # Misc local files
 *.log
 Thumbs.db
 .DS_Store
+.gitnexus
