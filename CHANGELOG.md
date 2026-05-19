@@ -6,6 +6,35 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex slow-path repair no longer routes normal CLI startup through an older
+  native hotfix binary. The managed launcher wrapper now intercepts only
+  picker-only `codex resume` list forms and delegates every other command to the
+  installed upstream `@openai/codex` launcher, preserving `codex-cli 0.130.0`
+  and 0.130-era feature config such as `[features.multi_agent_v2]`.
+- Codex native TUI `/resume` repair now preserves
+  `[mcp_servers.metamcp]` and reports its enabled state, endpoint, and startup
+  timeout as diagnostics. Guardian no longer writes `enabled = false`; when
+  MCP startup blocks the picker, the repair target is the MetaMCP route or
+  child-server health rather than disabling the configured server.
+- Codex session visibility repair now ships the title-aware v3
+  `codex-resume-picker.js` helper. It reads lightweight SQLite rows first,
+  enriches titles in bounded chunks, includes archived session rows and
+  `archived-large-sessions` manifests, displays updated time, and reinstalls
+  the global Codex launcher wrapper when npm upgrades overwrite it. This keeps
+  `codex resume` and `codex resume --all --no-alt-screen` usable on
+  `codex-cli 0.130.0` while preserving native `--last` and explicit session-id
+  resume paths.
+- Guardian now upgrades older materialized
+  `%USERPROFILE%\.codex\tools\repair-codex-resume.ps1` copies with a backup,
+  instead of leaving stale packaged repair scripts in place after app updates.
+- Codex `C4` slow-path classification no longer treats "sessions older than
+  30 days are still unarchived" as a failure by itself. Native Codex can
+  re-index old visible rows while rendering `/resume`, so Guardian now keeps
+  that count informational and avoids repeatedly archiving history the user is
+  trying to resume.
+
 ## [0.1.4] - 2026-05-15
 
 ### Added

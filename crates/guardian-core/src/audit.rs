@@ -36,10 +36,10 @@ pub struct RepairAuditRecord {
     pub trust_added_keys: Vec<String>,
     pub slow_path_launcher_path: Option<String>,
     pub slow_path_launcher_backup_path: Option<String>,
-    pub slow_path_hotfix_binary_path: Option<String>,
-    pub slow_path_hotfix_source_path: Option<String>,
+    pub slow_path_helper_path: Option<String>,
+    pub slow_path_metadata_path: Option<String>,
     pub slow_path_launcher_updated: bool,
-    pub slow_path_hotfix_binary_updated: bool,
+    pub slow_path_helper_updated: bool,
     pub slow_path_error: Option<String>,
 }
 

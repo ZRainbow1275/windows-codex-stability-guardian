@@ -6,12 +6,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Guardian releases assume the user has already installed `@openai/codex`
-# (the prerequisite for the tool's existence). The release zip therefore
-# ships ONLY guardian.exe + docs + the embedded repair script. The slow-path
-# (C4) launcher patch falls back to the user's own `vendor/<triple>/codex/codex.exe`
-# when no `vendor-hotfix/<triple>/codex/codex.exe` is staged, so we deliberately
-# do not bundle a copy of `codex.exe`.
+# Guardian must not downgrade the user's installed Codex CLI. The release zip
+# ships Guardian plus managed scripts/helpers only; the launcher wrapper delegates
+# non-picker commands to the upstream npm Codex launcher.
 
 function Get-RepoRoot {
     return (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
@@ -79,13 +76,19 @@ try {
     Copy-Item -LiteralPath (Join-Path $repoRoot "CHANGELOG.md") -Destination (Join-Path $stagingRoot "CHANGELOG.md")
     Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination (Join-Path $stagingRoot "LICENSE")
 
-    $bundledRepairScript = Join-Path $repoRoot "apps\guardian\assets\tools\repair-codex-resume.ps1"
+    $bundledToolsDir = Join-Path $repoRoot "apps\guardian\assets\tools"
+    $bundledRepairScript = Join-Path $bundledToolsDir "repair-codex-resume.ps1"
+    $bundledResumePicker = Join-Path $bundledToolsDir "codex-resume-picker.js"
     if (-not (Test-Path -LiteralPath $bundledRepairScript)) {
         throw "Bundled repair script missing at $bundledRepairScript; cannot package release."
+    }
+    if (-not (Test-Path -LiteralPath $bundledResumePicker)) {
+        throw "Bundled resume picker helper missing at $bundledResumePicker; cannot package release."
     }
     $stagingToolsDir = Join-Path $stagingRoot "tools"
     New-Item -ItemType Directory -Path $stagingToolsDir -Force | Out-Null
     Copy-Item -LiteralPath $bundledRepairScript -Destination (Join-Path $stagingToolsDir "repair-codex-resume.ps1")
+    Copy-Item -LiteralPath $bundledResumePicker -Destination (Join-Path $stagingToolsDir "codex-resume-picker.js")
 
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force

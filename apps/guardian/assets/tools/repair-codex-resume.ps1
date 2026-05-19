@@ -7,6 +7,8 @@ param(
     [switch]$ForceInstall
 )
 
+# GuardianCodexResumeRepair/2026-05-19-max-visible-v7
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -179,7 +181,7 @@ function Invoke-ResumeStateRepair {
         [string]$BackupRoot
     )
 
-    if (-not (Test-Path -LiteralPath $StateDbPath)) {
+    if ([string]::IsNullOrWhiteSpace($StateDbPath) -or -not (Test-Path -LiteralPath $StateDbPath)) {
         Write-WarnStep "State DB not found at $StateDbPath. Skipping DB repair."
         return
     }
@@ -218,6 +220,253 @@ function Invoke-ResumeStateRepair {
     Write-Step "SQLite backup: $backupPath"
 }
 
+function Show-MetamcpConfigDiagnostic {
+    param(
+        [string]$CodexHome
+    )
+
+    $configPath = Join-Path $CodexHome "config.toml"
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        Write-Step "Codex config.toml not found. Skipping MetaMCP config diagnostics."
+        return
+    }
+
+    $lines = [System.IO.File]::ReadAllLines($configPath)
+    $inMetamcp = $false
+    $foundMetamcp = $false
+    $enabledValue = "<default true>"
+    $startupTimeout = $null
+    $endpoint = $null
+
+    foreach ($line in $lines) {
+        if ($line -match '^\[mcp_servers\.metamcp\]$') {
+            $inMetamcp = $true
+            $foundMetamcp = $true
+            continue
+        }
+
+        if ($inMetamcp -and $line -match '^\[') {
+            break
+        }
+
+        if ($inMetamcp -and $line -match '^\s*enabled\s*=') {
+            $enabledValue = ($line -replace '^\s*enabled\s*=\s*', '').Trim()
+            continue
+        }
+
+        if ($inMetamcp -and $line -match '^\s*startup_timeout_sec\s*=') {
+            $startupTimeout = ($line -replace '^\s*startup_timeout_sec\s*=\s*', '').Trim()
+            continue
+        }
+
+        if ($inMetamcp -and $line -match '["''](https?://[^"'']+)["'']') {
+            $endpoint = $Matches[1]
+        }
+    }
+
+    if (-not $foundMetamcp) {
+        Write-Step "mcp_servers.metamcp is not configured."
+        return
+    }
+
+    Write-Step "mcp_servers.metamcp enabled value: $enabledValue"
+    if ($startupTimeout) {
+        Write-Step "mcp_servers.metamcp startup_timeout_sec: $startupTimeout"
+    }
+    if ($endpoint) {
+        Write-Step "mcp_servers.metamcp endpoint: $endpoint"
+    } else {
+        Write-WarnStep "mcp_servers.metamcp endpoint was not found in args."
+    }
+    Write-Step "Guardian preserves mcp_servers.metamcp. If native /resume stalls during MCP startup, repair the MetaMCP endpoint or child servers rather than disabling this config block."
+}
+
+function Get-DefaultModelProvider {
+    param(
+        [string]$CodexHome
+    )
+
+    $configPath = Join-Path $CodexHome "config.toml"
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $configPath) {
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#")) {
+            continue
+        }
+        $match = [regex]::Match($trimmed, "^model_provider\s*=\s*[""']([^""']+)[""']")
+        if ($match.Success) {
+            return $match.Groups[1].Value
+        }
+    }
+
+    return $null
+}
+
+function Show-NativeResumeVisibility {
+    param(
+        [string]$StateDbPath,
+        [string]$CodexHome
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StateDbPath) -or -not (Test-Path -LiteralPath $StateDbPath)) {
+        return
+    }
+
+    $sqliteCommand = Get-SqliteCommandInfo
+    if (-not $sqliteCommand) {
+        return
+    }
+
+    $sqliteExe = $sqliteCommand.Source
+    $defaultProvider = Get-DefaultModelProvider -CodexHome $CodexHome
+    $displayProvider = Get-TextOrFallback -Value $defaultProvider -Fallback "<not found>"
+    Write-Step "Default config model_provider: $displayProvider"
+    Write-Step "Native /resume filter contract: archived=0, first_user_message non-empty, matching model_provider, and exact cwd while the picker is on Cwd filter."
+
+    $knownProjects = @(
+        "D:\Desktop\Inkforge",
+        "D:\Desktop\LawSaw",
+        "D:\Desktop\CREATOR FOUR"
+    )
+    foreach ($project in $knownProjects) {
+        $escaped = $project.Replace("'", "''")
+        $rows = & $sqliteExe -header -column $StateDbPath "with normalized as (select cwd, replace(cwd,'\\?\','') as norm_cwd, model_provider, archived, first_user_message, title, has_user_event from threads) select cwd, model_provider, count(*) as total, sum(case when archived=0 then 1 else 0 end) as active, sum(case when archived=0 and trim(coalesce(first_user_message,''))<>'' then 1 else 0 end) as native_visible, sum(case when archived=0 and trim(coalesce(first_user_message,''))='' and trim(coalesce(title,''))<>'' then 1 else 0 end) as title_only, sum(case when archived=0 and has_user_event=1 then 1 else 0 end) as has_user_event from normalized where lower(norm_cwd)=lower('$escaped') group by cwd, model_provider order by cwd, model_provider;"
+        if ($rows) {
+            Write-Step "Native visibility by exact cwd/provider for $project"
+            $rows | ForEach-Object { Write-Step "  $_" }
+        }
+    }
+}
+
+function Install-ResumePickerWrapper {
+    param(
+        [string]$CodexHome
+    )
+
+    $npmGlobalRoot = $null
+    try {
+        $npmGlobalRoot = (& npm root -g 2>$null | Select-Object -First 1).Trim()
+    } catch {
+        Write-WarnStep "Unable to resolve npm global root. Skipping launcher wrapper install."
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($npmGlobalRoot)) {
+        Write-WarnStep "npm root -g returned an empty path. Skipping launcher wrapper install."
+        return
+    }
+
+    $packageRoot = Join-Path $npmGlobalRoot "@openai\codex"
+    $launcherPath = Join-Path $packageRoot "bin\codex.js"
+    $backupPath = Join-Path $packageRoot "bin\codex.upstream.resume-fix.js"
+    $helperPath = Join-Path $CodexHome "tools\codex-resume-picker.js"
+    $metadataPath = Join-Path $CodexHome "tools\codex-resume-fix.json"
+
+    if (-not (Test-Path -LiteralPath $launcherPath)) {
+        Write-WarnStep "Codex launcher not found at $launcherPath. Skipping launcher wrapper install."
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $helperPath)) {
+        Write-WarnStep "Resume picker helper not found at $helperPath. Skipping launcher wrapper install."
+        return
+    }
+
+    $launcherContent = Get-Content -LiteralPath $launcherPath -Raw -Encoding UTF8
+    $alreadyPatched = $launcherContent.Contains("codex.upstream.resume-fix.js")
+    $wrapperCurrent = $alreadyPatched -and $launcherContent.Contains("pickerOnlyFlags") -and $launcherContent.Contains("--max-visible") -and -not $launcherContent.Contains("CODEX_NATIVE_HOTFIX")
+
+    if (-not $alreadyPatched) {
+        Copy-Item -LiteralPath $launcherPath -Destination $backupPath -Force
+    } elseif (-not (Test-Path -LiteralPath $backupPath)) {
+        Write-WarnStep "Codex launcher is already wrapped but upstream backup is missing: $backupPath"
+        return
+    }
+
+    if (-not $wrapperCurrent) {
+        $wrapperContent = @'
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const args = process.argv.slice(2);
+const isResumeCommand = args[0] === 'resume';
+const resumeArgs = args.slice(1);
+const pickerOnlyFlags = new Set(['--all', '--no-alt-screen', '--include-non-interactive']);
+const hasNativeResumeTarget =
+  resumeArgs.includes('--last') ||
+  resumeArgs.some((arg) => !arg.startsWith('-')) ||
+  resumeArgs.some((arg) => !pickerOnlyFlags.has(arg));
+const shouldInterceptResume =
+  isResumeCommand &&
+  !hasNativeResumeTarget;
+
+const userHome = process.env.USERPROFILE || process.env.HOME || '';
+const helperPath =
+  process.env.CODEX_RESUME_FIX_HELPER ||
+  path.join(userHome, '.codex', 'tools', 'codex-resume-picker.js');
+const upstreamPath = path.join(__dirname, 'codex.upstream.resume-fix.js');
+
+function exitWith(result) {
+  process.exit(typeof result.status === 'number' ? result.status : 1);
+}
+
+if (shouldInterceptResume && existsSync(helperPath)) {
+  const helperArgs = [helperPath, '--pick', '--limit', '50', '--max-visible'];
+
+  const result = spawnSync(process.execPath, helperArgs, {
+    stdio: 'inherit',
+    env: process.env,
+  });
+
+  exitWith(result);
+}
+
+if (!existsSync(upstreamPath)) {
+  console.error(`Missing upstream Codex launcher backup: ${upstreamPath}`);
+  console.error('Rerun the Codex resume fix installer to repair the launcher.');
+  process.exit(1);
+}
+
+await import(pathToFileURL(upstreamPath).href);
+'@
+
+        [System.IO.File]::WriteAllText(
+            $launcherPath,
+            $wrapperContent,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Write-Step "Installed Codex resume picker launcher wrapper."
+    } else {
+        Write-Step "Codex resume picker launcher wrapper already installed."
+    }
+
+    $metadata = @{
+        installed_at = (Get-Date).ToString("s")
+        npm_global_root = $npmGlobalRoot
+        package_root = $packageRoot
+        launcher_path = $launcherPath
+        backup_path = $backupPath
+        helper_path = $helperPath
+        native_hotfix_present = $false
+        native_hotfix_note = "Disabled: launcher must preserve the installed Codex CLI version and delegate non-picker commands to upstream."
+        repair_script = $PSCommandPath
+    } | ConvertTo-Json -Depth 4
+
+    Set-Content -LiteralPath $metadataPath -Value $metadata -Encoding UTF8
+    Write-Step "Resume picker metadata: $metadataPath"
+}
+
 function Assert-HealthyVersion {
     param(
         [version]$Version,
@@ -244,7 +493,7 @@ function Show-VerificationGuide {
     Write-Step "  2. If 'Starting MCP servers...' is still visible, press Esc once."
     Write-Step "  3. Type: /resume"
     Write-Step "  4. Press Enter."
-    Write-Step "Fallback picker check:"
+    Write-Step "Important: the external fallback picker below is not proof that the in-app slash picker works; it only checks the launcher wrapper path."
     Write-Step "  codex resume --all --no-alt-screen"
 
     if ($RelatedProcessCount -gt 0) {
@@ -343,6 +592,9 @@ if ($TargetVersionObject) {
 }
 
 Invoke-ResumeStateRepair -StateDbPath $StateDbPath -BackupRoot (Join-Path $CodexHome "backups")
+Show-MetamcpConfigDiagnostic -CodexHome $CodexHome
+Show-NativeResumeVisibility -StateDbPath $StateDbPath -CodexHome $CodexHome
+Install-ResumePickerWrapper -CodexHome $CodexHome
 
 Write-Step "Repair complete. Active version: $afterText"
 Show-VerificationGuide -RelatedProcessCount $processCount

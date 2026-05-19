@@ -18,7 +18,7 @@ use guardian_windows::{
     },
     process::{CommandOutput, run_command_with_cmd_fallback},
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 const SESSION_ARCHIVE_GRACE_DAYS: i64 = 30;
 const RESUME_STUCK_THRESHOLD: Duration = Duration::from_secs(60);
@@ -91,6 +91,53 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
         repair_script.exists().to_string(),
     ));
 
+    let config_path = codex_config_path().map_err(GuardianError::Io)?;
+    evidence.push(EvidenceItem::new(
+        "codex_config_path",
+        config_path.display().to_string(),
+    ));
+    evidence.push(EvidenceItem::new(
+        "codex_config_present",
+        config_path.exists().to_string(),
+    ));
+    let default_model_provider = read_default_model_provider(&config_path)?;
+    if let Some(provider) = &default_model_provider {
+        evidence.push(EvidenceItem::new(
+            "codex_default_model_provider",
+            provider.clone(),
+        ));
+    }
+    let metamcp_config = inspect_metamcp_config(&config_path)?;
+    evidence.push(EvidenceItem::new(
+        "mcp_metamcp_defined",
+        metamcp_config.defined.to_string(),
+    ));
+    evidence.push(EvidenceItem::new(
+        "mcp_metamcp_disabled",
+        metamcp_config.disabled.to_string(),
+    ));
+    evidence.push(EvidenceItem::new(
+        "mcp_metamcp_enabled",
+        metamcp_config.enabled.to_string(),
+    ));
+    if let Some(timeout) = &metamcp_config.startup_timeout_sec {
+        evidence.push(EvidenceItem::new(
+            "mcp_metamcp_startup_timeout_sec",
+            timeout.clone(),
+        ));
+    }
+    if let Some(endpoint) = &metamcp_config.endpoint_url {
+        evidence.push(EvidenceItem::new("mcp_metamcp_endpoint", endpoint.clone()));
+    }
+    if metamcp_config.defined && metamcp_config.enabled && metamcp_config.endpoint_url.is_none() {
+        status = StatusLevel::Warn;
+        failure_classes.push(FailureClass::C5);
+        notes.push(
+            "`mcp_servers.metamcp` is enabled but Guardian could not find a streamable HTTP endpoint in its args; repair the endpoint configuration instead of disabling the server."
+                .to_string(),
+        );
+    }
+
     let state_files = codex_state_db_candidates(&codex_home).map_err(GuardianError::Io)?;
     evidence.push(EvidenceItem::new(
         "state_files",
@@ -102,12 +149,58 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
             "latest_state_file",
             latest_state.display().to_string(),
         ));
-        match inspect_state_db(&latest_state) {
+        match inspect_state_db(
+            &latest_state,
+            project_path,
+            default_model_provider.as_deref(),
+        ) {
             Ok(stats) => {
                 evidence.push(EvidenceItem::new(
                     "threads_total",
                     stats.thread_count.to_string(),
                 ));
+                evidence.push(EvidenceItem::new(
+                    "native_visible_threads",
+                    stats.native_visible_threads.to_string(),
+                ));
+                evidence.push(EvidenceItem::new(
+                    "empty_first_user_message_threads",
+                    stats.empty_first_user_message_threads.to_string(),
+                ));
+                evidence.push(EvidenceItem::new(
+                    "native_visible_by_provider",
+                    stats.native_visible_by_provider.clone(),
+                ));
+                if let Some(count) = stats.default_provider_native_visible_threads {
+                    evidence.push(EvidenceItem::new(
+                        "default_provider_native_visible_threads",
+                        count.to_string(),
+                    ));
+                }
+                if let Some(count) = stats.project_native_visible_exact_cwd {
+                    evidence.push(EvidenceItem::new(
+                        "project_native_visible_exact_cwd",
+                        count.to_string(),
+                    ));
+                }
+                if let Some(count) = stats.project_native_visible_prefixed_cwd {
+                    evidence.push(EvidenceItem::new(
+                        "project_native_visible_prefixed_cwd",
+                        count.to_string(),
+                    ));
+                }
+                if let Some(count) = stats.project_default_provider_native_visible_threads {
+                    evidence.push(EvidenceItem::new(
+                        "project_default_provider_native_visible_threads",
+                        count.to_string(),
+                    ));
+                }
+                if let Some(count) = stats.project_any_provider_native_visible_threads {
+                    evidence.push(EvidenceItem::new(
+                        "project_any_provider_native_visible_threads",
+                        count.to_string(),
+                    ));
+                }
                 evidence.push(EvidenceItem::new(
                     "stale_rows",
                     stats.stale_rows.to_string(),
@@ -128,12 +221,33 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
                     );
                 }
                 if stats.old_unarchived_threads > 0 {
-                    status = StatusLevel::Warn;
-                    failure_classes.push(FailureClass::C4);
                     notes.push(format!(
-                        "Detected {} Codex thread(s) older than {} days that are still unarchived; they can be archived safely and may contribute to `/resume` slow-path.",
+                        "Observed {} Codex thread(s) older than {} days that are still unarchived. This is informational: native Codex can re-index old visible sessions after `/resume`, so this count is no longer treated as a C4 slow-path failure by itself.",
                         stats.old_unarchived_threads,
                         SESSION_ARCHIVE_GRACE_DAYS
+                    ));
+                }
+                if let (Some(default_count), Some(any_count), Some(provider)) = (
+                    stats.project_default_provider_native_visible_threads,
+                    stats.project_any_provider_native_visible_threads,
+                    default_model_provider.as_deref(),
+                ) && default_count == 0
+                    && any_count > 0
+                {
+                    status = StatusLevel::Warn;
+                    notes.push(format!(
+                        "Codex native `/resume` would show 0 row(s) for the target project under provider `{provider}`, but {any_count} visible row(s) exist under other provider/path combinations. The in-app picker filters by active model_provider unless the native hotfix is used."
+                    ));
+                }
+                if let (Some(exact), Some(prefixed)) = (
+                    stats.project_native_visible_exact_cwd,
+                    stats.project_native_visible_prefixed_cwd,
+                ) && exact == 0
+                    && prefixed > 0
+                {
+                    status = StatusLevel::Warn;
+                    notes.push(format!(
+                        "Codex native `/resume` has {prefixed} visible row(s) under the `\\\\?\\` cwd variant but 0 under the exact target cwd. The native hotfix queries both cwd variants."
                     ));
                 }
             }
@@ -219,6 +333,14 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
                     "Recent Codex TUI log lines include configuration/access errors.".to_string(),
                 );
             }
+            if log_signals.has_mcp_startup_error {
+                status = StatusLevel::Warn;
+                failure_classes.push(FailureClass::C5);
+                notes.push(
+                    "Recent Codex TUI log lines include MCP startup endpoint errors; inspect MetaMCP route and child-server health while keeping the MCP server enabled."
+                        .to_string(),
+                );
+            }
         }
         None => {
             evidence.push(EvidenceItem::new("codex_tui_log_present", "false"));
@@ -228,16 +350,6 @@ pub fn observe_with_target(project_path: Option<&Path>) -> Result<DomainReport, 
             );
         }
     }
-
-    let config_path = codex_config_path().map_err(GuardianError::Io)?;
-    evidence.push(EvidenceItem::new(
-        "codex_config_path",
-        config_path.display().to_string(),
-    ));
-    evidence.push(EvidenceItem::new(
-        "codex_config_present",
-        config_path.exists().to_string(),
-    ));
 
     if let Some(trust_target) = resolve_trust_target(project_path, log_signals.as_ref()) {
         evidence.push(EvidenceItem::new(
@@ -339,12 +451,40 @@ fn count_session_files(root: &Path) -> Result<usize, GuardianError> {
     Ok(count)
 }
 
-fn inspect_state_db(path: &Path) -> Result<CodexStateDbStats, GuardianError> {
+fn inspect_state_db(
+    path: &Path,
+    project_path: Option<&Path>,
+    default_model_provider: Option<&str>,
+) -> Result<CodexStateDbStats, GuardianError> {
     let connection = Connection::open(path)
         .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
     let thread_count: i64 = connection
         .query_row("select count(*) from threads", [], |row| row.get(0))
         .map_err(|error| GuardianError::invalid_state(format!("threads count failed: {error}")))?;
+    let native_visible_threads: i64 = connection
+        .query_row(
+            "select count(*) from threads where archived = 0 and trim(coalesce(first_user_message, '')) <> ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("native visible query failed: {error}"))
+        })?;
+    let empty_first_user_message_threads: i64 = connection
+        .query_row(
+            "select count(*) from threads where archived = 0 and trim(coalesce(first_user_message, '')) = ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!(
+                "empty first_user_message query failed: {error}"
+            ))
+        })?;
+    let native_visible_by_provider = native_visible_by_provider(&connection)?;
+    let default_provider_native_visible_threads = default_model_provider
+        .map(|provider| native_visible_count_for_provider(&connection, provider))
+        .transpose()?;
     let stale_rows: i64 = connection
         .query_row(
             "select count(*) from threads where has_user_event = 0 and trim(coalesce(first_user_message, '')) <> ''",
@@ -362,11 +502,225 @@ fn inspect_state_db(path: &Path) -> Result<CodexStateDbStats, GuardianError> {
         .map_err(|error| {
             GuardianError::invalid_state(format!("old unarchived thread query failed: {error}"))
         })?;
+    let project_cwds = project_path.map(cwd_filter_variants);
+    let project_native_visible_exact_cwd = project_cwds
+        .as_ref()
+        .and_then(|cwds| cwds.first())
+        .map(|cwd| native_visible_count_for_cwd(&connection, cwd, None))
+        .transpose()?;
+    let project_native_visible_prefixed_cwd = project_cwds
+        .as_ref()
+        .and_then(|cwds| cwds.get(1))
+        .map(|cwd| native_visible_count_for_cwd(&connection, cwd, None))
+        .transpose()?;
+    let project_default_provider_native_visible_threads =
+        match (project_cwds.as_ref(), default_model_provider) {
+            (Some(cwds), Some(provider)) => Some(native_visible_count_for_cwds(
+                &connection,
+                cwds,
+                Some(provider),
+            )?),
+            _ => None,
+        };
+    let project_any_provider_native_visible_threads = project_cwds
+        .as_ref()
+        .map(|cwds| native_visible_count_for_cwds(&connection, cwds, None))
+        .transpose()?;
     Ok(CodexStateDbStats {
         thread_count,
+        native_visible_threads,
+        empty_first_user_message_threads,
+        native_visible_by_provider,
+        default_provider_native_visible_threads,
         stale_rows,
         old_unarchived_threads,
+        project_native_visible_exact_cwd,
+        project_native_visible_prefixed_cwd,
+        project_default_provider_native_visible_threads,
+        project_any_provider_native_visible_threads,
     })
+}
+
+fn read_default_model_provider(config_path: &Path) -> Result<Option<String>, GuardianError> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let config_text = std::fs::read_to_string(config_path)?;
+    for line in config_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(value) = trimmed.strip_prefix("model_provider") else {
+            continue;
+        };
+        let Some(value) = value.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if let Some(value) = value.strip_prefix('"').and_then(|v| v.split('"').next()) {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn inspect_metamcp_config(config_path: &Path) -> Result<MetamcpConfigStats, GuardianError> {
+    if !config_path.exists() {
+        return Ok(MetamcpConfigStats::default());
+    }
+
+    let config_text = std::fs::read_to_string(config_path)?;
+    let mut in_metamcp = false;
+    let mut stats = MetamcpConfigStats::default();
+
+    for line in config_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[mcp_servers.metamcp]" {
+            in_metamcp = true;
+            stats.defined = true;
+            continue;
+        }
+        if in_metamcp && trimmed.starts_with('[') {
+            break;
+        }
+        if !in_metamcp || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("enabled") {
+            if let Some(value) = value.trim_start().strip_prefix('=') {
+                stats.enabled_value = Some(value.trim().to_ascii_lowercase());
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("startup_timeout_sec") {
+            if let Some(value) = value.trim_start().strip_prefix('=') {
+                stats.startup_timeout_sec = Some(value.trim().to_string());
+            }
+            continue;
+        }
+        if stats.endpoint_url.is_none() {
+            stats.endpoint_url = extract_quoted_http_url(trimmed);
+        }
+    }
+
+    stats.disabled = stats.enabled_value.as_deref() == Some("false");
+    stats.enabled = stats.defined && !stats.disabled;
+    Ok(stats)
+}
+
+fn extract_quoted_http_url(line: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let mut rest = line;
+        while let Some(start) = rest.find(quote) {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find(quote) else {
+                break;
+            };
+            let candidate = &rest[..end];
+            if candidate.starts_with("http://") || candidate.starts_with("https://") {
+                return Some(candidate.to_string());
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+    None
+}
+
+fn native_visible_by_provider(connection: &Connection) -> Result<String, GuardianError> {
+    let mut statement = connection
+        .prepare(
+            "select coalesce(model_provider, '') as provider, count(*) from threads where archived = 0 and trim(coalesce(first_user_message, '')) <> '' group by provider order by count(*) desc, provider asc",
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("provider visibility prepare failed: {error}"))
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            let provider: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok(format!("{provider}:{count}"))
+        })
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("provider visibility query failed: {error}"))
+        })?;
+    let mut parts = Vec::new();
+    for row in rows {
+        parts.push(row.map_err(|error| {
+            GuardianError::invalid_state(format!("provider visibility row failed: {error}"))
+        })?);
+    }
+    if parts.is_empty() {
+        Ok("none".to_string())
+    } else {
+        Ok(parts.join(" | "))
+    }
+}
+
+fn native_visible_count_for_provider(
+    connection: &Connection,
+    provider: &str,
+) -> Result<i64, GuardianError> {
+    connection
+        .query_row(
+            "select count(*) from threads where archived = 0 and trim(coalesce(first_user_message, '')) <> '' and model_provider = ?1",
+            [provider],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            GuardianError::invalid_state(format!("provider native visible query failed: {error}"))
+        })
+}
+
+fn native_visible_count_for_cwd(
+    connection: &Connection,
+    cwd: &str,
+    provider: Option<&str>,
+) -> Result<i64, GuardianError> {
+    match provider {
+        Some(provider) => connection
+            .query_row(
+                "select count(*) from threads where archived = 0 and trim(coalesce(first_user_message, '')) <> '' and cwd = ?1 and model_provider = ?2",
+                params![cwd, provider],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                GuardianError::invalid_state(format!("cwd/provider native visible query failed: {error}"))
+            }),
+        None => connection
+            .query_row(
+                "select count(*) from threads where archived = 0 and trim(coalesce(first_user_message, '')) <> '' and cwd = ?1",
+                [cwd],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                GuardianError::invalid_state(format!("cwd native visible query failed: {error}"))
+            }),
+    }
+}
+
+fn native_visible_count_for_cwds(
+    connection: &Connection,
+    cwds: &[String],
+    provider: Option<&str>,
+) -> Result<i64, GuardianError> {
+    let mut total = 0;
+    for cwd in cwds {
+        total += native_visible_count_for_cwd(connection, cwd, provider)?;
+    }
+    Ok(total)
+}
+
+fn cwd_filter_variants(path: &Path) -> Vec<String> {
+    let cwd = path.display().to_string();
+    let mut variants = vec![cwd.clone()];
+    if cfg!(target_os = "windows")
+        && !cwd.starts_with(r"\\?\")
+        && cwd.as_bytes().get(1) == Some(&b':')
+    {
+        variants.push(format!(r"\\?\{cwd}"));
+    }
+    variants
 }
 
 fn archive_cutoff_epoch(days: i64) -> i64 {
@@ -474,6 +828,7 @@ fn collect_codex_log_signals() -> Result<Option<CodexLogSignals>, GuardianError>
     let mut matches = Vec::new();
     let mut has_loading_sessions = false;
     let mut has_config_error = false;
+    let mut has_mcp_startup_error = false;
     let mut trust_project_path = None;
     for line in tail.lines() {
         let trimmed = line.trim();
@@ -487,6 +842,7 @@ fn collect_codex_log_signals() -> Result<Option<CodexLogSignals>, GuardianError>
 
         has_loading_sessions |= is_loading_sessions_signal(trimmed);
         has_config_error |= is_config_error_signal(trimmed);
+        has_mcp_startup_error |= is_mcp_startup_error_signal(trimmed);
         if let Some(path) = extract_trust_warning_path(trimmed) {
             trust_project_path = Some(path);
         }
@@ -501,6 +857,7 @@ fn collect_codex_log_signals() -> Result<Option<CodexLogSignals>, GuardianError>
         matches,
         has_loading_sessions,
         has_config_error,
+        has_mcp_startup_error,
         trust_project_path,
     }))
 }
@@ -529,6 +886,7 @@ fn is_codex_log_signal(line: &str) -> bool {
 
     is_loading_sessions_signal(line)
         || is_config_error_signal(line)
+        || is_mcp_startup_error_signal(line)
         || is_trust_warning_signal(line)
 }
 
@@ -553,6 +911,12 @@ fn is_config_error_signal(line: &str) -> bool {
     line.contains("Error loading configuration:")
         || line.contains("os error 5")
         || line.contains("拒绝访问。 (os error 5)")
+}
+
+fn is_mcp_startup_error_signal(line: &str) -> bool {
+    (line.contains("Error POSTing to endpoint") && line.contains("HTTP 404"))
+        || line.contains("Cannot POST /api/mcp")
+        || line.contains("EAI_AGAIN metamcp-abcoder")
 }
 
 fn is_trust_warning_signal(line: &str) -> bool {
@@ -615,14 +979,33 @@ struct CodexLogSignals {
     matches: Vec<String>,
     has_loading_sessions: bool,
     has_config_error: bool,
+    has_mcp_startup_error: bool,
     trust_project_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 struct CodexStateDbStats {
     thread_count: i64,
+    native_visible_threads: i64,
+    empty_first_user_message_threads: i64,
+    native_visible_by_provider: String,
+    default_provider_native_visible_threads: Option<i64>,
     stale_rows: i64,
     old_unarchived_threads: i64,
+    project_native_visible_exact_cwd: Option<i64>,
+    project_native_visible_prefixed_cwd: Option<i64>,
+    project_default_provider_native_visible_threads: Option<i64>,
+    project_any_provider_native_visible_threads: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MetamcpConfigStats {
+    defined: bool,
+    disabled: bool,
+    enabled: bool,
+    enabled_value: Option<String>,
+    startup_timeout_sec: Option<String>,
+    endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -700,8 +1083,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CodexResumeProcessObservation, extract_trust_warning_path, is_codex_log_signal,
-        is_trust_warning_signal, last_unique, parse_resume_process_signals,
+        CodexResumeProcessObservation, extract_trust_warning_path, inspect_metamcp_config,
+        is_codex_log_signal, is_trust_warning_signal, last_unique, parse_resume_process_signals,
     };
 
     #[test]
@@ -741,6 +1124,71 @@ mod tests {
     }
 
     #[test]
+    fn mcp_startup_errors_are_log_signals() {
+        assert!(is_codex_log_signal(
+            "Error POSTing to endpoint (HTTP 404): Cannot POST /api/mcp"
+        ));
+        assert!(is_codex_log_signal("getaddrinfo EAI_AGAIN metamcp-abcoder"));
+    }
+
+    #[test]
+    fn metamcp_enabled_config_preserves_endpoint_diagnostics() {
+        let path = unique_temp_file("codex-metamcp-enabled.toml");
+        std::fs::write(
+            &path,
+            r#"[mcp_servers.metamcp]
+type = "stdio"
+args = [
+    "mcp-proxy",
+    "--transport",
+    "streamablehttp",
+    "http://localhost:48008/metamcp/claude/mcp",
+]
+startup_timeout_sec = 100.0
+
+[mcp_servers.memory]
+type = "stdio"
+"#,
+        )
+        .expect("write config");
+
+        let stats = inspect_metamcp_config(&path).expect("inspect config");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(stats.defined);
+        assert!(!stats.disabled);
+        assert!(stats.enabled);
+        assert_eq!(
+            stats.endpoint_url.as_deref(),
+            Some("http://localhost:48008/metamcp/claude/mcp")
+        );
+        assert_eq!(stats.startup_timeout_sec.as_deref(), Some("100.0"));
+    }
+
+    #[test]
+    fn metamcp_enabled_false_is_reported_as_disabled() {
+        let path = unique_temp_file("codex-metamcp-disabled.toml");
+        std::fs::write(
+            &path,
+            r#"[mcp_servers.metamcp]
+type = "stdio"
+enabled = false
+
+[mcp_servers.metamcp.env]
+NO_PROXY = "localhost"
+"#,
+        )
+        .expect("write config");
+
+        let stats = inspect_metamcp_config(&path).expect("inspect config");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(stats.defined);
+        assert!(stats.disabled);
+        assert!(!stats.enabled);
+    }
+
+    #[test]
     fn parses_resume_process_observations() {
         let output = "16092\t4210\tC:\\Users\\Example\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\codex\\codex.exe resume\n";
         let signals = parse_resume_process_signals(output);
@@ -754,5 +1202,11 @@ mod tests {
             }
         );
         assert_eq!(signals.stuck_count(), 1);
+    }
+
+    fn unique_temp_file(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("{}-{}", std::process::id(), name));
+        path
     }
 }

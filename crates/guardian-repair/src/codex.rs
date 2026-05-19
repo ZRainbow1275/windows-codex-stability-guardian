@@ -23,6 +23,8 @@ const REPAIR_PREFIX: &str = "[codex-resume-repair]";
 const BACKUP_PREFIX: &str = "SQLite backup:";
 const ACTIVE_VERSION_PREFIX: &str = "Repair complete. Active version:";
 const SESSION_ARCHIVE_GRACE_DAYS: i64 = 30;
+const REPAIR_SCRIPT_VERSION_MARKER: &str = "GuardianCodexResumeRepair/2026-05-19-max-visible-v7";
+const RESUME_PICKER_VERSION_MARKER: &str = "GuardianCodexResumePicker/2026-05-19-max-visible-v5";
 
 /// Trusted PowerShell repair script bundled into `guardian.exe`. The original lives at
 /// `apps/guardian/assets/tools/repair-codex-resume.ps1` and is materialized to
@@ -30,6 +32,8 @@ const SESSION_ARCHIVE_GRACE_DAYS: i64 = 30;
 /// the historical "trusted repair script is missing" hard-fail.
 const EMBEDDED_REPAIR_SCRIPT: &str =
     include_str!("../../../apps/guardian/assets/tools/repair-codex-resume.ps1");
+const EMBEDDED_RESUME_PICKER: &str =
+    include_str!("../../../apps/guardian/assets/tools/codex-resume-picker.js");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexRepairOutcome {
@@ -82,10 +86,10 @@ pub struct CodexTrustRepair {
 pub struct CodexSlowPathRepair {
     pub launcher_path: PathBuf,
     pub launcher_backup_path: Option<PathBuf>,
-    pub hotfix_binary_path: PathBuf,
-    pub hotfix_source_path: PathBuf,
+    pub helper_path: PathBuf,
+    pub metadata_path: PathBuf,
     pub launcher_updated: bool,
-    pub hotfix_binary_updated: bool,
+    pub helper_updated: bool,
 }
 
 impl CodexRepairExecution {
@@ -101,51 +105,38 @@ impl CodexRepairExecution {
         let slow_path_repaired = self
             .slow_path_repair
             .as_ref()
-            .is_some_and(|repair| repair.launcher_updated || repair.hotfix_binary_updated);
+            .is_some_and(|repair| repair.launcher_updated || repair.helper_updated);
         let stale_repaired = matches!(
             (self.stale_rows_before, self.stale_rows_after),
             (Some(before), Some(after)) if before > 0 && after == 0
-        );
-        let old_sessions_archived = matches!(
-            (self.old_sessions_before, self.old_sessions_after),
-            (Some(before), Some(after)) if before > after
-        );
-        let old_session_archive_incomplete = matches!(
-            (self.old_sessions_before, self.old_sessions_after),
-            (Some(before), Some(after)) if before > 0 && after > 0
         );
         let mut repaired_steps = Vec::new();
         if stale_repaired {
             repaired_steps.push("cleared stale rows");
         }
-        if old_sessions_archived {
-            repaired_steps.push("archived Codex sessions older than 30 days");
-        }
         if trust_added {
             repaired_steps.push("appended missing trusted project entries");
         }
         if slow_path_repaired {
-            repaired_steps.push("staged the Codex slow-path launcher hotfix");
+            repaired_steps.push("staged the Codex resume picker wrapper");
         }
 
         match self.outcome {
             CodexRepairOutcome::Noop => {
-                "Codex repair confirm completed without changing stale rows, 30-day session archive state, trust entries, or slow-path launcher state."
+                "Codex repair confirm completed without changing stale rows, trust entries, or slow-path launcher state."
                     .to_string()
             }
             CodexRepairOutcome::Repaired => {
                 if repaired_steps.is_empty() {
-                    "Codex repair confirm completed without changing stale rows, 30-day session archive state, trust entries, or slow-path launcher state."
+                    "Codex repair confirm completed without changing stale rows, trust entries, or slow-path launcher state."
                         .to_string()
                 } else {
                     format!("Codex repair confirm {}.", repaired_steps.join(", "))
                 }
             }
             CodexRepairOutcome::Unresolved => {
-                let tail = if old_session_archive_incomplete {
-                    "but some sessions older than 30 days remained unarchived after verification."
-                } else if self.slow_path_error.is_some() {
-                    "but the Codex slow-path launcher hotfix step was skipped due to an error (see notes)."
+                let tail = if self.slow_path_error.is_some() {
+                    "but the Codex resume picker wrapper step was skipped due to an error (see notes)."
                 } else {
                     "but stale rows still remain after verification."
                 };
@@ -179,20 +170,6 @@ impl CodexRepairExecution {
                 backup_path.display()
             ));
         }
-        if let (Some(before), Some(after), Some(days)) = (
-            self.old_sessions_before,
-            self.old_sessions_after,
-            self.old_session_archive_days,
-        ) && before > 0
-        {
-            notes.push(format!(
-                "Codex session archive applied with a {days}-day retention window: old_unarchived_before={before}, old_unarchived_after={after}"
-            ));
-            notes.push(
-                "Existing `codex resume` processes were not stopped; restart the stuck picker to observe the refreshed session list."
-                    .to_string(),
-            );
-        }
         if let Some(trust_repair) = &self.trust_repair {
             notes.push(format!(
                 "Trusted project target: {}",
@@ -221,12 +198,12 @@ impl CodexRepairExecution {
                 slow_path_repair.launcher_path.display()
             ));
             notes.push(format!(
-                "Codex slow-path hotfix source: {}",
-                slow_path_repair.hotfix_source_path.display()
+                "Codex resume picker helper path: {}",
+                slow_path_repair.helper_path.display()
             ));
             notes.push(format!(
-                "Codex slow-path hotfix binary path: {}",
-                slow_path_repair.hotfix_binary_path.display()
+                "Codex resume picker metadata path: {}",
+                slow_path_repair.metadata_path.display()
             ));
             if let Some(launcher_backup_path) = &slow_path_repair.launcher_backup_path {
                 notes.push(format!(
@@ -239,13 +216,13 @@ impl CodexRepairExecution {
                 slow_path_repair.launcher_updated
             ));
             notes.push(format!(
-                "Codex slow-path hotfix binary updated: {}",
-                slow_path_repair.hotfix_binary_updated
+                "Codex resume picker helper updated: {}",
+                slow_path_repair.helper_updated
             ));
         }
         if let Some(slow_path_error) = &self.slow_path_error {
             notes.push(format!(
-                "Codex slow-path launcher hotfix was skipped: {slow_path_error}"
+                "Codex resume picker wrapper was skipped: {slow_path_error}"
             ));
         }
         if !self.stdout_excerpt.is_empty() {
@@ -271,13 +248,13 @@ pub fn planned_actions(project_path: Option<&Path>) -> Vec<ActionPlan> {
     vec![
         ActionPlan::new(
             dry_run,
-            "Preview the Codex repair chain, including trust recovery, 30-day session archiving, and slow-path launcher staging when those drifts are identified."
+            "Preview the Codex repair chain, including trust recovery and slow-path launcher staging when those drifts are identified."
                 .to_string(),
             false,
         ),
         ActionPlan::new(
             confirm,
-            "Execute the managed Codex repair chain with backup, verification, audit, 30-day session archiving, and controlled slow-path launcher hotfix staging."
+            "Execute the managed Codex repair chain with backup, verification, audit, and controlled resume picker wrapper staging."
                 .to_string(),
             true,
         ),
@@ -289,9 +266,10 @@ pub fn execute_confirmed(
 ) -> Result<CodexRepairExecution, GuardianError> {
     let observer_report = codex_observer::observe_with_target(project_path)?;
     let repair_stale_rows = domain_has_failure_class(&observer_report, "C2");
-    let repair_old_sessions = domain_has_failure_class(&observer_report, "C4")
-        && domain_evidence_i64(&observer_report, "old_unarchived_threads")
-            .is_some_and(|count| count > 0);
+    // Old visible sessions are not a durable slow-path repair target. Native Codex
+    // can re-index them as unarchived while rendering `/resume`, and hiding them
+    // conflicts with the user's goal of finding historical sessions.
+    let repair_old_sessions = false;
     let repair_slow_path = slow_path_repair_required();
     let trust_target = trust_target_from_report(&observer_report);
 
@@ -397,7 +375,7 @@ pub fn execute_confirmed(
     if repair_slow_path {
         match apply_slow_path_repair() {
             Ok(slow_path_repair) => {
-                if slow_path_repair.launcher_updated || slow_path_repair.hotfix_binary_updated {
+                if slow_path_repair.launcher_updated || slow_path_repair.helper_updated {
                     execution.outcome = CodexRepairOutcome::Repaired;
                 }
                 execution.slow_path_repair = Some(slow_path_repair);
@@ -421,33 +399,72 @@ fn repair_script_path(codex_home: &Path) -> PathBuf {
     codex_home.join("tools").join("repair-codex-resume.ps1")
 }
 
-/// Materialize the bundled repair script into `<codex_home>/tools/` if it is missing.
+fn resume_picker_path(codex_home: &Path) -> PathBuf {
+    codex_home.join("tools").join("codex-resume-picker.js")
+}
+
+/// Materialize or upgrade the bundled repair script into `<codex_home>/tools/`.
 ///
-/// Returns the canonical script path. The function is idempotent: when the destination
-/// already exists its bytes are left untouched so user-side edits or upgrade-time backups
-/// are preserved. Failures during write surface as `io::Error` so callers can propagate
-/// them through `GuardianError::Io`.
+/// Existing scripts from older Guardian releases are backed up before replacement so users
+/// upgrading from a packaged build receive the current launcher-wrapper repair instead of
+/// silently keeping a stale helper.
 pub fn ensure_repair_script_installed(codex_home: &Path) -> std::io::Result<PathBuf> {
     let script_path = repair_script_path(codex_home);
-    if script_path.exists() {
-        return Ok(script_path);
-    }
-    if let Some(parent) = script_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&script_path, EMBEDDED_REPAIR_SCRIPT.as_bytes())?;
-    Ok(script_path)
+    install_embedded_tool(
+        &script_path,
+        EMBEDDED_REPAIR_SCRIPT,
+        REPAIR_SCRIPT_VERSION_MARKER,
+    )
+}
+
+pub fn ensure_resume_picker_installed(codex_home: &Path) -> std::io::Result<PathBuf> {
+    let picker_path = resume_picker_path(codex_home);
+    install_embedded_tool(
+        &picker_path,
+        EMBEDDED_RESUME_PICKER,
+        RESUME_PICKER_VERSION_MARKER,
+    )
 }
 
 /// Best-effort startup hook that lays down every Guardian-owned helper under `~/.codex/tools/`.
 ///
-/// Today only `repair-codex-resume.ps1` is bundled; future additions should plug in here so
-/// the app entry point keeps a single deploy call. Errors are returned to the caller, which
-/// is expected to log-and-continue rather than abort startup.
+/// Errors are returned to the caller, which is expected to log-and-continue rather than abort
+/// startup.
 pub fn ensure_codex_tools_deployed() -> std::io::Result<PathBuf> {
     let codex_home = codex_home_dir()?;
     fs::create_dir_all(&codex_home)?;
-    ensure_repair_script_installed(&codex_home)
+    let script_path = ensure_repair_script_installed(&codex_home)?;
+    ensure_resume_picker_installed(&codex_home)?;
+    Ok(script_path)
+}
+
+fn install_embedded_tool(
+    destination_path: &Path,
+    embedded_contents: &str,
+    version_marker: &str,
+) -> std::io::Result<PathBuf> {
+    if destination_path.exists() {
+        let existing = fs::read_to_string(destination_path).unwrap_or_default();
+        if existing.contains(version_marker) {
+            return Ok(destination_path.to_path_buf());
+        }
+
+        let backup_path = destination_path.with_file_name(format!(
+            "{}.pre-guardian-upgrade-{}.bak",
+            destination_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("codex-tool"),
+            Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        fs::copy(destination_path, backup_path)?;
+    }
+
+    if let Some(parent) = destination_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(destination_path, embedded_contents.as_bytes())?;
+    Ok(destination_path.to_path_buf())
 }
 
 fn inspect_stale_rows(path: &Path) -> Result<i64, GuardianError> {
@@ -617,10 +634,6 @@ fn domain_evidence_value<'a>(
         .map(|item| item.value.as_str())
 }
 
-fn domain_evidence_i64(report: &guardian_core::types::DomainReport, key: &str) -> Option<i64> {
-    domain_evidence_value(report, key)?.trim().parse().ok()
-}
-
 #[derive(Debug, Clone)]
 struct TrustRepairTarget {
     path: PathBuf,
@@ -718,8 +731,10 @@ fn backup_codex_config(
 }
 
 fn apply_slow_path_repair() -> Result<CodexSlowPathRepair, GuardianError> {
+    let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
+    let script_path = ensure_repair_script_installed(&codex_home).map_err(GuardianError::Io)?;
+    let helper_path = ensure_resume_picker_installed(&codex_home).map_err(GuardianError::Io)?;
     let package_root = resolve_codex_package_root()?;
-    let target_triple = current_target_triple()?;
     let launcher_path = package_root.join("bin").join("codex.js");
     if !launcher_path.exists() {
         return Err(GuardianError::invalid_state(format!(
@@ -728,67 +743,46 @@ fn apply_slow_path_repair() -> Result<CodexSlowPathRepair, GuardianError> {
         )));
     }
 
-    let hotfix_binary_path = package_root
-        .join("vendor-hotfix")
-        .join(target_triple)
-        .join("codex")
-        .join(codex_binary_name());
-    let hotfix_source_candidates = hotfix_source_candidates(
-        &package_root,
-        &env::temp_dir(),
-        bundled_hotfix_root().as_deref(),
-        target_triple,
-        codex_binary_name(),
-    );
-    let hotfix_source_path = hotfix_source_candidates
-        .iter()
-        .find(|candidate| candidate.exists())
-        .cloned()
-        .ok_or_else(|| {
-            let checked_paths = hotfix_source_candidates
-                .iter()
-                .map(|candidate| format!("`{}`", candidate.display()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            GuardianError::invalid_state(format!(
-                "unable to locate a verified Codex hotfix binary; checked {checked_paths}"
-            ))
-        })?;
-
-    let hotfix_binary_updated = stage_hotfix_binary(&hotfix_source_path, &hotfix_binary_path)?;
-    let launcher_text = fs::read_to_string(&launcher_path)?;
-    let (patched_launcher_text, launcher_updated) = ensure_hotfix_launcher_patch(&launcher_text)?;
-    let launcher_backup_path = if launcher_updated {
-        let backup_path = backup_codex_launcher(&launcher_path, &launcher_text)?;
-        fs::write(&launcher_path, patched_launcher_text)?;
-        Some(backup_path)
-    } else {
-        None
-    };
+    let before_launcher_text = fs::read_to_string(&launcher_path).unwrap_or_default();
+    let wrapper_was_current = resume_picker_wrapper_is_current(&before_launcher_text);
+    let state_db_path = latest_codex_state_db(&codex_home)
+        .map_err(GuardianError::Io)?
+        .unwrap_or_else(|| codex_home.join("state_5.sqlite"));
+    let target_version = current_codex_version();
+    let _process_output = run_repair_script(
+        &script_path,
+        &codex_home,
+        &state_db_path,
+        target_version.as_deref(),
+    )?;
 
     let verified_launcher_text = fs::read_to_string(&launcher_path)?;
-    if !verified_launcher_text.contains("vendor-hotfix")
-        || !verified_launcher_text.contains("existsSync(hotfixBinaryPath)")
-    {
+    if !resume_picker_wrapper_is_current(&verified_launcher_text) {
         return Err(GuardianError::invalid_state(format!(
-            "Codex launcher verification failed after patching `{}`",
+            "Codex resume picker wrapper verification failed after patching `{}`",
             launcher_path.display()
         )));
     }
-    if !hotfix_binary_path.exists() {
+    if !helper_path.exists() {
         return Err(GuardianError::invalid_state(format!(
-            "expected staged hotfix binary at `{}` after repair",
-            hotfix_binary_path.display()
+            "expected resume picker helper at `{}` after repair",
+            helper_path.display()
         )));
     }
+    let launcher_backup_path = package_root
+        .join("bin")
+        .join("codex.upstream.resume-fix.js");
+    let metadata_path = codex_home.join("tools").join("codex-resume-fix.json");
 
     Ok(CodexSlowPathRepair {
         launcher_path,
-        launcher_backup_path,
-        hotfix_binary_path,
-        hotfix_source_path,
-        launcher_updated,
-        hotfix_binary_updated,
+        launcher_backup_path: launcher_backup_path
+            .exists()
+            .then_some(launcher_backup_path),
+        helper_path,
+        metadata_path,
+        launcher_updated: !wrapper_was_current,
+        helper_updated: true,
     })
 }
 
@@ -796,28 +790,25 @@ fn slow_path_repair_required() -> bool {
     let Ok(package_root) = resolve_codex_package_root() else {
         return false;
     };
-    let Ok(target_triple) = current_target_triple() else {
-        return false;
-    };
     let launcher_path = package_root.join("bin").join("codex.js");
     let Ok(launcher_text) = fs::read_to_string(&launcher_path) else {
         return false;
     };
-    let hotfix_binary_path = package_root
-        .join("vendor-hotfix")
-        .join(target_triple)
-        .join("codex")
-        .join(codex_binary_name());
-    let Ok(hotfix_source) = find_hotfix_source_binary(&package_root, target_triple) else {
-        return false;
-    };
-    let Some(hotfix_source) = hotfix_source else {
-        return false;
-    };
+    let helper_current = codex_home_dir()
+        .ok()
+        .map(|codex_home| resume_picker_path(&codex_home))
+        .and_then(|helper_path| fs::read_to_string(helper_path).ok())
+        .is_some_and(|helper_text| helper_text.contains(RESUME_PICKER_VERSION_MARKER));
 
-    let launcher_missing_hotfix = !launcher_text.contains("vendor-hotfix")
-        || !launcher_text.contains("existsSync(hotfixBinaryPath)");
-    launcher_missing_hotfix || (hotfix_source != hotfix_binary_path && !hotfix_binary_path.exists())
+    !resume_picker_wrapper_is_current(&launcher_text) || !helper_current
+}
+
+fn resume_picker_wrapper_is_current(launcher_text: &str) -> bool {
+    launcher_text.contains("codex.upstream.resume-fix.js")
+        && launcher_text.contains("codex-resume-picker.js")
+        && launcher_text.contains("pickerOnlyFlags")
+        && launcher_text.contains("--max-visible")
+        && !launcher_text.contains("CODEX_NATIVE_HOTFIX")
 }
 
 fn resolve_codex_package_root() -> Result<PathBuf, GuardianError> {
@@ -856,174 +847,6 @@ fn codex_package_root_candidates() -> Result<Vec<PathBuf>, GuardianError> {
     }
 
     dedupe_paths(candidates)
-}
-
-fn find_hotfix_source_binary(
-    package_root: &Path,
-    target_triple: &str,
-) -> Result<Option<PathBuf>, GuardianError> {
-    let hotfix_binary_name = codex_binary_name();
-    for candidate in hotfix_source_candidates(
-        package_root,
-        &env::temp_dir(),
-        bundled_hotfix_root().as_deref(),
-        target_triple,
-        hotfix_binary_name,
-    ) {
-        if candidate.exists() {
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(None)
-}
-
-fn hotfix_source_candidates(
-    package_root: &Path,
-    temp_root: &Path,
-    bundled_root: Option<&Path>,
-    target_triple: &str,
-    binary_name: &str,
-) -> Vec<PathBuf> {
-    let mut candidates = vec![
-        package_root
-            .join("vendor-hotfix")
-            .join(target_triple)
-            .join("codex")
-            .join(binary_name),
-    ];
-    if let Some(bundled_root) = bundled_root {
-        candidates.push(
-            bundled_root
-                .join(target_triple)
-                .join("codex")
-                .join(binary_name),
-        );
-    }
-    candidates.push(
-        temp_root
-            .join("codex-src")
-            .join("codex-rs")
-            .join("target")
-            .join("release")
-            .join(binary_name),
-    );
-    dedupe_paths(candidates).expect("path dedupe should be infallible")
-}
-
-fn bundled_hotfix_root() -> Option<PathBuf> {
-    let current_exe = env::current_exe().ok()?;
-    let exe_dir = current_exe.parent()?;
-    Some(exe_dir.join("vendor-hotfix"))
-}
-
-fn current_target_triple() -> Result<&'static str, GuardianError> {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
-        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
-        (os, arch) => Err(GuardianError::invalid_state(format!(
-            "unsupported platform for Codex launcher staging: {os} ({arch})"
-        ))),
-    }
-}
-
-fn codex_binary_name() -> &'static str {
-    if cfg!(windows) { "codex.exe" } else { "codex" }
-}
-
-fn stage_hotfix_binary(source_path: &Path, destination_path: &Path) -> Result<bool, GuardianError> {
-    if source_path == destination_path {
-        return Ok(false);
-    }
-
-    if destination_path.exists() && files_identical(source_path, destination_path)? {
-        return Ok(false);
-    }
-
-    if let Some(parent) = destination_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(source_path, destination_path)?;
-    Ok(true)
-}
-
-fn files_identical(left: &Path, right: &Path) -> Result<bool, GuardianError> {
-    let left_metadata = fs::metadata(left)?;
-    let right_metadata = fs::metadata(right)?;
-    if left_metadata.len() != right_metadata.len() {
-        return Ok(false);
-    }
-
-    Ok(fs::read(left)? == fs::read(right)?)
-}
-
-fn ensure_hotfix_launcher_patch(contents: &str) -> Result<(String, bool), GuardianError> {
-    if contents
-        .contains("const hotfixVendorRoot = path.join(__dirname, \"..\", \"vendor-hotfix\");")
-        && contents.contains("const hotfixBinaryPath = path.join(")
-        && contents.contains("existsSync(hotfixBinaryPath)")
-    {
-        return Ok((contents.to_string(), false));
-    }
-
-    let original_vendor_block = r#"const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-const localVendorRoot = path.join(__dirname, "..", "vendor");
-const localBinaryPath = path.join(
-  localVendorRoot,
-  targetTriple,
-  "codex",
-  codexBinaryName,
-);"#;
-    let patched_vendor_block = r#"const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-const localVendorRoot = path.join(__dirname, "..", "vendor");
-const hotfixVendorRoot = path.join(__dirname, "..", "vendor-hotfix");
-const localBinaryPath = path.join(
-  localVendorRoot,
-  targetTriple,
-  "codex",
-  codexBinaryName,
-);
-const hotfixBinaryPath = path.join(
-  hotfixVendorRoot,
-  targetTriple,
-  "codex",
-  codexBinaryName,
-);"#;
-    let patched_contents = contents.replacen(original_vendor_block, patched_vendor_block, 1);
-    if patched_contents == contents {
-        return Err(GuardianError::invalid_state(
-            "unable to locate the expected Codex launcher vendor block",
-        ));
-    }
-
-    let original_binary_line =
-        r#"const binaryPath = path.join(archRoot, "codex", codexBinaryName);"#;
-    let patched_binary_line = r#"const binaryPath = existsSync(hotfixBinaryPath)
-  ? hotfixBinaryPath
-  : path.join(archRoot, "codex", codexBinaryName);"#;
-    let patched_contents = patched_contents.replacen(original_binary_line, patched_binary_line, 1);
-    if !patched_contents.contains("existsSync(hotfixBinaryPath)") {
-        return Err(GuardianError::invalid_state(
-            "unable to inject the Codex launcher hotfix binary override",
-        ));
-    }
-
-    Ok((patched_contents, true))
-}
-
-fn backup_codex_launcher(
-    launcher_path: &Path,
-    existing_text: &str,
-) -> Result<PathBuf, GuardianError> {
-    let backup_path = launcher_path.with_file_name(format!(
-        "codex.js.pre-resume-hotfix-{}.bak",
-        Local::now().format("%Y%m%d-%H%M%S")
-    ));
-    fs::write(&backup_path, existing_text)?;
-    Ok(backup_path)
 }
 
 fn dedupe_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, GuardianError> {
@@ -1252,10 +1075,11 @@ struct ProcessOutput {
 mod tests {
     use super::{
         ACTIVE_VERSION_PREFIX, BACKUP_PREFIX, CodexRepairExecution, CodexRepairOutcome,
-        CodexTrustRepair, EMBEDDED_REPAIR_SCRIPT, REPAIR_PREFIX, active_version_from_output,
-        backup_path_from_output, command_with_project_path, ensure_hotfix_launcher_patch,
-        ensure_repair_script_installed, hotfix_source_candidates, normalize_repair_prefix,
-        parse_semver_fragment, render_repair_script_bootstrap,
+        CodexTrustRepair, EMBEDDED_REPAIR_SCRIPT, EMBEDDED_RESUME_PICKER, REPAIR_PREFIX,
+        REPAIR_SCRIPT_VERSION_MARKER, RESUME_PICKER_VERSION_MARKER, active_version_from_output,
+        backup_path_from_output, command_with_project_path, ensure_repair_script_installed,
+        ensure_resume_picker_installed, normalize_repair_prefix, parse_semver_fragment,
+        render_repair_script_bootstrap,
     };
     use std::path::{Path, PathBuf};
 
@@ -1265,7 +1089,11 @@ mod tests {
             "{REPAIR_PREFIX} Step one\n{REPAIR_PREFIX} {BACKUP_PREFIX} C:\\Users\\example\\.codex\\backups\\state_9.sqlite.pre-has-user-event-heal-20260415-210000.bak"
         );
         let backup = backup_path_from_output(&stdout).expect("expected backup path");
-        assert!(backup.ends_with("state_9.sqlite.pre-has-user-event-heal-20260415-210000.bak"));
+        assert!(
+            backup
+                .to_string_lossy()
+                .ends_with("state_9.sqlite.pre-has-user-event-heal-20260415-210000.bak")
+        );
     }
 
     #[test]
@@ -1300,52 +1128,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn launcher_patch_injects_vendor_hotfix_override() {
-        let original = r#"const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
-const localVendorRoot = path.join(__dirname, "..", "vendor");
-const localBinaryPath = path.join(
-  localVendorRoot,
-  targetTriple,
-  "codex",
-  codexBinaryName,
-);
-
-let vendorRoot;
-const archRoot = path.join(vendorRoot, targetTriple);
-const binaryPath = path.join(archRoot, "codex", codexBinaryName);"#;
-
-        let (patched, updated) =
-            ensure_hotfix_launcher_patch(original).expect("launcher patch should apply");
-        assert!(updated);
-        assert!(
-            patched.contains(
-                "const hotfixVendorRoot = path.join(__dirname, \"..\", \"vendor-hotfix\");"
-            )
-        );
-        assert!(patched.contains("const hotfixBinaryPath = path.join("));
-        assert!(patched.contains("const binaryPath = existsSync(hotfixBinaryPath)"));
-    }
-
-    #[test]
-    fn launcher_patch_is_idempotent() {
-        let patched = r#"const hotfixVendorRoot = path.join(__dirname, "..", "vendor-hotfix");
-const hotfixBinaryPath = path.join(
-  hotfixVendorRoot,
-  targetTriple,
-  "codex",
-  codexBinaryName,
-);
-const binaryPath = existsSync(hotfixBinaryPath)
-  ? hotfixBinaryPath
-  : path.join(archRoot, "codex", codexBinaryName);"#;
-
-        let (second_pass, updated) =
-            ensure_hotfix_launcher_patch(patched).expect("launcher patch should stay valid");
-        assert!(!updated);
-        assert_eq!(second_pass, patched);
-    }
-
     fn sample_trust_repair() -> CodexTrustRepair {
         CodexTrustRepair {
             target_project_path: PathBuf::from(r"D:\Workspaces\Guardian Project"),
@@ -1363,7 +1145,7 @@ const binaryPath = existsSync(hotfixBinaryPath)
     #[test]
     fn slow_path_error_preserves_trust_repair_and_surfaces_note() {
         // Simulates the soft-failure branch of `execute_confirmed` where
-        // `apply_slow_path_repair` failed (e.g. no hotfix binary available on
+        // `apply_slow_path_repair` failed (e.g. the resume picker wrapper could not be installed on
         // the workstation) but stale-row and trust repair already landed. The
         // execution must still be returned so the audit can be persisted and
         // the CLI/GUI/tray surfaces show the actionable error.
@@ -1382,7 +1164,7 @@ const binaryPath = existsSync(hotfixBinaryPath)
             outcome: CodexRepairOutcome::Repaired,
             trust_repair: Some(sample_trust_repair()),
             slow_path_repair: None,
-            slow_path_error: Some("unable to locate a verified Codex hotfix binary".to_string()),
+            slow_path_error: Some("unable to install Codex resume picker wrapper".to_string()),
         };
         // Trust repair succeeded so the overall outcome stays `Repaired`; the
         // skip is reported as an evidence/note and does not downgrade prior work.
@@ -1394,10 +1176,10 @@ const binaryPath = existsSync(hotfixBinaryPath)
         );
         let notes = execution.notes();
         assert!(
-            notes.iter().any(
-                |note| note.contains("slow-path launcher hotfix was skipped")
-                    && note.contains("unable to locate a verified Codex hotfix binary")
-            ),
+            notes
+                .iter()
+                .any(|note| note.contains("resume picker wrapper was skipped")
+                    && note.contains("unable to install Codex resume picker wrapper")),
             "notes must surface the slow-path skip reason: {notes:?}"
         );
 
@@ -1412,35 +1194,7 @@ const binaryPath = existsSync(hotfixBinaryPath)
         assert!(
             execution
                 .outcome_summary()
-                .contains("slow-path launcher hotfix step was skipped")
-        );
-    }
-
-    #[test]
-    fn source_candidates_prioritize_vendor_hotfix_before_temp_build() {
-        let candidates = hotfix_source_candidates(
-            Path::new(r"C:\Users\Example\AppData\Roaming\npm\node_modules\@openai\codex"),
-            Path::new(r"C:\Users\Example\AppData\Local\Temp"),
-            Some(Path::new(
-                r"D:\Workspaces\Guardian Project\dist\v0.1.0\vendor-hotfix",
-            )),
-            "x86_64-pc-windows-msvc",
-            "codex.exe",
-        );
-
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from(
-                    r"C:\Users\Example\AppData\Roaming\npm\node_modules\@openai\codex\vendor-hotfix\x86_64-pc-windows-msvc\codex\codex.exe"
-                ),
-                PathBuf::from(
-                    r"D:\Workspaces\Guardian Project\dist\v0.1.0\vendor-hotfix\x86_64-pc-windows-msvc\codex\codex.exe"
-                ),
-                PathBuf::from(
-                    r"C:\Users\Example\AppData\Local\Temp\codex-src\codex-rs\target\release\codex.exe"
-                ),
-            ]
+                .contains("resume picker wrapper step was skipped")
         );
     }
 
@@ -1471,8 +1225,80 @@ const binaryPath = existsSync(hotfixBinaryPath)
             "embedded script must emit the audited prefix Guardian parses"
         );
         assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains(REPAIR_SCRIPT_VERSION_MARKER),
+            "embedded script must carry the managed upgrade marker"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("Install-ResumePickerWrapper"),
+            "embedded script must reinstall the resume picker launcher wrapper"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("--max-visible"),
+            "embedded script must make the launcher wrapper use the max-visible picker policy"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("Native /resume filter contract"),
+            "embedded script must print native in-app /resume visibility diagnostics"
+        );
+        assert!(
+            !EMBEDDED_REPAIR_SCRIPT.contains("process.env.CODEX_NATIVE_HOTFIX"),
+            "embedded script must not route normal Codex invocations to an older native hotfix binary"
+        );
+        assert!(
+            !EMBEDDED_REPAIR_SCRIPT.contains("spawn(nativeHotfixPath"),
+            "embedded script must preserve the installed upstream Codex launcher for non-picker commands"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("Show-MetamcpConfigDiagnostic"),
+            "embedded script must report the metamcp config without disabling it"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("mcp_servers.metamcp"),
+            "embedded script must identify the exact metamcp MCP server config"
+        );
+        assert!(
+            !EMBEDDED_REPAIR_SCRIPT.contains("enabled = false"),
+            "embedded script must not disable metamcp in config.toml"
+        );
+        assert!(
             EMBEDDED_REPAIR_SCRIPT.contains("$StateDbPath"),
             "embedded script must accept the StateDbPath parameter"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains(RESUME_PICKER_VERSION_MARKER),
+            "embedded picker helper must carry the managed upgrade marker"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("collectSessionRows"),
+            "embedded picker helper must use the lightweight SQLite session index"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("enrichPreviews"),
+            "embedded picker helper must enrich titles after the lightweight query"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("archived-large-sessions"),
+            "embedded picker helper must understand archived large session manifests"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("Updated:"),
+            "embedded picker helper must display updated time in the picker"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("Native /resume Visibility Doctor"),
+            "embedded picker helper must diagnose the native in-app /resume filters"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("--max-visible"),
+            "embedded picker helper must expose the max-visible default policy"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("Policy:"),
+            "embedded picker helper must print the active visibility policy"
+        );
+        assert!(
+            EMBEDDED_RESUME_PICKER.contains("first_user_message non-empty"),
+            "embedded picker helper must document the native first_user_message visibility filter"
         );
     }
 
@@ -1492,21 +1318,79 @@ const binaryPath = existsSync(hotfixBinaryPath)
     }
 
     #[test]
-    fn ensure_repair_script_installed_preserves_existing_content() {
+    fn ensure_repair_script_installed_upgrades_outdated_content_with_backup() {
         let temp = tempfile::tempdir().expect("create tempdir");
         let codex_home = temp.path();
-        let custom_payload = b"# operator-customized repair script\n";
+        let custom_payload = b"# older bundled repair script\n";
         let tools_dir = codex_home.join("tools");
         std::fs::create_dir_all(&tools_dir).expect("seed tools dir");
         std::fs::write(tools_dir.join("repair-codex-resume.ps1"), custom_payload)
-            .expect("seed custom script");
+            .expect("seed outdated script");
 
-        let path = ensure_repair_script_installed(codex_home).expect("idempotent install");
+        let path = ensure_repair_script_installed(codex_home).expect("upgrade install");
 
-        let preserved = std::fs::read(&path).expect("read preserved script");
+        let upgraded = std::fs::read(&path).expect("read upgraded script");
         assert_eq!(
-            preserved, custom_payload,
-            "existing operator-owned script must not be overwritten"
+            upgraded,
+            EMBEDDED_REPAIR_SCRIPT.as_bytes(),
+            "outdated managed script must be upgraded"
         );
+        let backup_count = std::fs::read_dir(&tools_dir)
+            .expect("read tools dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("repair-codex-resume.ps1.pre-guardian-upgrade-")
+            })
+            .count();
+        assert_eq!(backup_count, 1, "outdated script must be backed up");
+    }
+
+    #[test]
+    fn ensure_resume_picker_installed_writes_when_missing() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let codex_home = temp.path();
+
+        let path = ensure_resume_picker_installed(codex_home).expect("install picker");
+
+        assert_eq!(
+            path,
+            codex_home.join("tools").join("codex-resume-picker.js")
+        );
+        let written = std::fs::read(&path).expect("read written picker");
+        assert_eq!(written, EMBEDDED_RESUME_PICKER.as_bytes());
+    }
+
+    #[test]
+    fn ensure_resume_picker_installed_upgrades_outdated_content_with_backup() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let codex_home = temp.path();
+        let custom_payload = b"// older bundled resume picker\n";
+        let tools_dir = codex_home.join("tools");
+        std::fs::create_dir_all(&tools_dir).expect("seed tools dir");
+        std::fs::write(tools_dir.join("codex-resume-picker.js"), custom_payload)
+            .expect("seed outdated picker");
+
+        let path = ensure_resume_picker_installed(codex_home).expect("upgrade picker");
+
+        let upgraded = std::fs::read(&path).expect("read upgraded picker");
+        assert_eq!(
+            upgraded,
+            EMBEDDED_RESUME_PICKER.as_bytes(),
+            "outdated managed picker must be upgraded"
+        );
+        let backup_count = std::fs::read_dir(&tools_dir)
+            .expect("read tools dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("codex-resume-picker.js.pre-guardian-upgrade-")
+            })
+            .count();
+        assert_eq!(backup_count, 1, "outdated picker must be backed up");
     }
 }

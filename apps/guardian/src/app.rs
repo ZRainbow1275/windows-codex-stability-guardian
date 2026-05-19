@@ -26,7 +26,9 @@ use crate::{
 };
 
 pub fn run(cli: Cli) -> Result<i32, GuardianError> {
-    deploy_codex_tools_best_effort();
+    if should_deploy_codex_tools_on_startup(&cli) {
+        deploy_codex_tools_best_effort();
+    }
     match cli.command {
         Some(Command::Check(args)) => handle_check(&cli.global, args),
         Some(Command::Repair(args)) => handle_repair(&cli.global, args),
@@ -36,6 +38,16 @@ pub fn run(cli: Cli) -> Result<i32, GuardianError> {
         Some(Command::Tray(args)) => handle_tray(&cli.global, args),
         None => handle_default_command(&cli.global),
     }
+}
+
+fn should_deploy_codex_tools_on_startup(cli: &Cli) -> bool {
+    cli.global.confirm
+        && matches!(
+            cli.command,
+            Some(Command::Repair(RepairArgs {
+                target: RepairTarget::Codex(_),
+            }))
+        )
 }
 
 fn deploy_codex_tools_best_effort() {
@@ -252,16 +264,16 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                     .codex
                     .evidence
                     .push(guardian_core::types::EvidenceItem::new(
-                        "repair_slow_path_hotfix_binary_path",
-                        slow_path_repair.hotfix_binary_path.display().to_string(),
+                        "repair_slow_path_helper_path",
+                        slow_path_repair.helper_path.display().to_string(),
                     ));
                 report
                     .domains
                     .codex
                     .evidence
                     .push(guardian_core::types::EvidenceItem::new(
-                        "repair_slow_path_hotfix_source_path",
-                        slow_path_repair.hotfix_source_path.display().to_string(),
+                        "repair_slow_path_metadata_path",
+                        slow_path_repair.metadata_path.display().to_string(),
                     ));
                 report
                     .domains
@@ -276,8 +288,8 @@ fn handle_repair(global: &GlobalArgs, args: RepairArgs) -> Result<i32, GuardianE
                     .codex
                     .evidence
                     .push(guardian_core::types::EvidenceItem::new(
-                        "repair_slow_path_hotfix_binary_updated",
-                        slow_path_repair.hotfix_binary_updated.to_string(),
+                        "repair_slow_path_helper_updated",
+                        slow_path_repair.helper_updated.to_string(),
                     ));
                 if let Some(launcher_backup_path) = &slow_path_repair.launcher_backup_path {
                     report
@@ -802,22 +814,22 @@ fn persist_codex_repair_audit(
             .as_ref()
             .and_then(|repair| repair.launcher_backup_path.as_ref())
             .map(|path| path.display().to_string()),
-        slow_path_hotfix_binary_path: execution
+        slow_path_helper_path: execution
             .slow_path_repair
             .as_ref()
-            .map(|repair| repair.hotfix_binary_path.display().to_string()),
-        slow_path_hotfix_source_path: execution
+            .map(|repair| repair.helper_path.display().to_string()),
+        slow_path_metadata_path: execution
             .slow_path_repair
             .as_ref()
-            .map(|repair| repair.hotfix_source_path.display().to_string()),
+            .map(|repair| repair.metadata_path.display().to_string()),
         slow_path_launcher_updated: execution
             .slow_path_repair
             .as_ref()
             .is_some_and(|repair| repair.launcher_updated),
-        slow_path_hotfix_binary_updated: execution
+        slow_path_helper_updated: execution
             .slow_path_repair
             .as_ref()
-            .is_some_and(|repair| repair.hotfix_binary_updated),
+            .is_some_and(|repair| repair.helper_updated),
         slow_path_error: execution.slow_path_error.clone(),
     };
 
@@ -1035,5 +1047,30 @@ fn exit_code_for_check(status: StatusLevel) -> i32 {
         StatusLevel::Ok => 0,
         StatusLevel::Warn => 2,
         StatusLevel::Fail => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, should_deploy_codex_tools_on_startup};
+
+    #[test]
+    fn startup_deployment_is_skipped_for_read_only_codex_commands() {
+        let check = Cli::parse_from(["guardian", "check"]);
+        assert!(!should_deploy_codex_tools_on_startup(&check));
+
+        let dry_run = Cli::parse_from(["guardian", "repair", "codex", "--dry-run"]);
+        assert!(!should_deploy_codex_tools_on_startup(&dry_run));
+    }
+
+    #[test]
+    fn startup_deployment_requires_confirmed_codex_repair() {
+        let codex_confirm = Cli::parse_from(["guardian", "repair", "codex", "--confirm"]);
+        assert!(should_deploy_codex_tools_on_startup(&codex_confirm));
+
+        let docker_confirm = Cli::parse_from(["guardian", "repair", "docker", "--confirm"]);
+        assert!(!should_deploy_codex_tools_on_startup(&docker_confirm));
     }
 }
