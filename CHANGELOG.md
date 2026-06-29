@@ -8,6 +8,11 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- Codex `has_user_event` drift repair is now project-scoped when a
+  `--project-path` is supplied. Guardian passes that cwd through both the stale
+  row repair and slow-path wrapper install paths, so a single-folder `/resume`
+  incident can be healed without backfilling unrelated global Codex threads or
+  archiving any sessions.
 - Codex slow-path repair no longer routes normal CLI startup through an older
   native hotfix binary. The managed launcher wrapper now intercepts only
   picker-only `codex resume` list forms and delegates every other command to the

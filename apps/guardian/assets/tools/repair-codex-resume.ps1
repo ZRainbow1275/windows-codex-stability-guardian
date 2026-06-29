@@ -3,11 +3,12 @@ param(
     [string]$TargetVersion = "",
     [string]$CodexHome = "",
     [string]$StateDbPath = "",
+    [string]$RepairCwd = "",
     [switch]$SkipInstall,
     [switch]$ForceInstall
 )
 
-# GuardianCodexResumeRepair/2026-05-19-max-visible-v7
+# GuardianCodexResumeRepair/2026-06-30-scoped-resume-v8
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -175,10 +176,54 @@ function Get-IntegerFromText {
     return $value
 }
 
+function ConvertTo-SqliteLiteral {
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Get-NormalizedCwdText {
+    param(
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+
+    $normalized = $Path.Trim()
+    if ($normalized.StartsWith('\\?\')) {
+        $normalized = $normalized.Substring(4)
+    }
+
+    return $normalized.Replace('/', '\')
+}
+
+function Get-StaleRowsWhereSql {
+    param(
+        [AllowEmptyString()]
+        [string]$RepairCwd
+    )
+
+    $base = "has_user_event = 0 and trim(coalesce(first_user_message,'')) <> ''"
+    $normalizedRepairCwd = Get-NormalizedCwdText -Path $RepairCwd
+    if ([string]::IsNullOrWhiteSpace($normalizedRepairCwd)) {
+        return $base
+    }
+
+    $repairCwdLiteral = ConvertTo-SqliteLiteral -Value $normalizedRepairCwd
+    return "$base and lower(replace(cwd,'\\?\','')) = lower($repairCwdLiteral)"
+}
+
 function Invoke-ResumeStateRepair {
     param(
         [string]$StateDbPath,
-        [string]$BackupRoot
+        [string]$BackupRoot,
+        [string]$RepairCwd
     )
 
     if ([string]::IsNullOrWhiteSpace($StateDbPath) -or -not (Test-Path -LiteralPath $StateDbPath)) {
@@ -193,11 +238,19 @@ function Invoke-ResumeStateRepair {
     }
 
     $sqliteExe = $sqliteCommand.Source
-    $staleCountText = & $sqliteExe $StateDbPath "select count(*) from threads where has_user_event = 0 and trim(first_user_message) <> '';"
+    $whereSql = Get-StaleRowsWhereSql -RepairCwd $RepairCwd
+    $normalizedRepairCwd = Get-NormalizedCwdText -Path $RepairCwd
+    if ([string]::IsNullOrWhiteSpace($normalizedRepairCwd)) {
+        Write-Step "DB repair scope: all Codex thread rows."
+    } else {
+        Write-Step "Scoped DB repair cwd: $normalizedRepairCwd"
+    }
+
+    $staleCountText = & $sqliteExe $StateDbPath "select count(*) from threads where $whereSql;"
     $staleCount = Get-IntegerFromText -Text ($staleCountText | Select-Object -First 1)
 
     if ($staleCount -le 0) {
-        Write-Step "threads.has_user_event looks healthy. No DB repair needed."
+        Write-Step "threads.has_user_event looks healthy for the selected repair scope. No DB repair needed."
         return
     }
 
@@ -210,10 +263,10 @@ function Invoke-ResumeStateRepair {
     $backupPath = Join-Path $BackupRoot ("$stateDbFileName.pre-has-user-event-heal-$timestamp.bak")
     & $sqliteExe $StateDbPath ".backup '$backupPath'" | Out-Null
 
-    $updateText = & $sqliteExe $StateDbPath "PRAGMA busy_timeout = 5000; begin immediate; update threads set has_user_event = 1 where has_user_event = 0 and trim(first_user_message) <> ''; select changes(); commit;"
+    $updateText = & $sqliteExe $StateDbPath "PRAGMA busy_timeout = 5000; begin immediate; update threads set has_user_event = 1 where $whereSql; select changes(); commit;"
     $changedCount = Get-IntegerFromText -Text ($updateText | Select-Object -Last 1)
 
-    $afterCountText = & $sqliteExe $StateDbPath "select count(*) from threads where has_user_event = 0 and trim(first_user_message) <> '';"
+    $afterCountText = & $sqliteExe $StateDbPath "select count(*) from threads where $whereSql;"
     $afterCount = Get-IntegerFromText -Text ($afterCountText | Select-Object -First 1)
 
     Write-Step "Repaired threads.has_user_event drift. stale_before=$staleCount changed=$changedCount stale_after=$afterCount"
@@ -308,7 +361,8 @@ function Get-DefaultModelProvider {
 function Show-NativeResumeVisibility {
     param(
         [string]$StateDbPath,
-        [string]$CodexHome
+        [string]$CodexHome,
+        [string]$RepairCwd
     )
 
     if ([string]::IsNullOrWhiteSpace($StateDbPath) -or -not (Test-Path -LiteralPath $StateDbPath)) {
@@ -326,11 +380,18 @@ function Show-NativeResumeVisibility {
     Write-Step "Default config model_provider: $displayProvider"
     Write-Step "Native /resume filter contract: archived=0, first_user_message non-empty, matching model_provider, and exact cwd while the picker is on Cwd filter."
 
-    $knownProjects = @(
+    $knownProjects = @()
+    $normalizedRepairCwd = Get-NormalizedCwdText -Path $RepairCwd
+    if (-not [string]::IsNullOrWhiteSpace($normalizedRepairCwd)) {
+        $knownProjects += $normalizedRepairCwd
+    }
+    $knownProjects += @(
         "D:\Desktop\Inkforge",
         "D:\Desktop\LawSaw",
-        "D:\Desktop\CREATOR FOUR"
+        "D:\Desktop\CREATOR FOUR",
+        "D:\Desktop\CREATOR SIX"
     )
+    $knownProjects = @($knownProjects | Select-Object -Unique)
     foreach ($project in $knownProjects) {
         $escaped = $project.Replace("'", "''")
         $rows = & $sqliteExe -header -column $StateDbPath "with normalized as (select cwd, replace(cwd,'\\?\','') as norm_cwd, model_provider, archived, first_user_message, title, has_user_event from threads) select cwd, model_provider, count(*) as total, sum(case when archived=0 then 1 else 0 end) as active, sum(case when archived=0 and trim(coalesce(first_user_message,''))<>'' then 1 else 0 end) as native_visible, sum(case when archived=0 and trim(coalesce(first_user_message,''))='' and trim(coalesce(title,''))<>'' then 1 else 0 end) as title_only, sum(case when archived=0 and has_user_event=1 then 1 else 0 end) as has_user_event from normalized where lower(norm_cwd)=lower('$escaped') group by cwd, model_provider order by cwd, model_provider;"
@@ -591,9 +652,9 @@ if ($TargetVersionObject) {
     throw "Unable to read codex version after repair. Provide -TargetVersion or make sure codex is available in PATH."
 }
 
-Invoke-ResumeStateRepair -StateDbPath $StateDbPath -BackupRoot (Join-Path $CodexHome "backups")
+Invoke-ResumeStateRepair -StateDbPath $StateDbPath -BackupRoot (Join-Path $CodexHome "backups") -RepairCwd $RepairCwd
 Show-MetamcpConfigDiagnostic -CodexHome $CodexHome
-Show-NativeResumeVisibility -StateDbPath $StateDbPath -CodexHome $CodexHome
+Show-NativeResumeVisibility -StateDbPath $StateDbPath -CodexHome $CodexHome -RepairCwd $RepairCwd
 Install-ResumePickerWrapper -CodexHome $CodexHome
 
 Write-Step "Repair complete. Active version: $afterText"

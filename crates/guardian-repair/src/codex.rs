@@ -23,7 +23,7 @@ const REPAIR_PREFIX: &str = "[codex-resume-repair]";
 const BACKUP_PREFIX: &str = "SQLite backup:";
 const ACTIVE_VERSION_PREFIX: &str = "Repair complete. Active version:";
 const SESSION_ARCHIVE_GRACE_DAYS: i64 = 30;
-const REPAIR_SCRIPT_VERSION_MARKER: &str = "GuardianCodexResumeRepair/2026-05-19-max-visible-v7";
+const REPAIR_SCRIPT_VERSION_MARKER: &str = "GuardianCodexResumeRepair/2026-06-30-scoped-resume-v8";
 const RESUME_PICKER_VERSION_MARKER: &str = "GuardianCodexResumePicker/2026-05-19-max-visible-v5";
 
 /// Trusted PowerShell repair script bundled into `guardian.exe`. The original lives at
@@ -293,6 +293,7 @@ pub fn execute_confirmed(
 
     if repair_stale_rows || repair_old_sessions {
         let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
+        let repair_cwd = project_path;
         let state_db_path = latest_codex_state_db(&codex_home)
             .map_err(GuardianError::Io)?
             .ok_or_else(|| {
@@ -313,15 +314,16 @@ pub fn execute_confirmed(
                 )));
             }
 
-            let stale_rows_before = inspect_stale_rows(&state_db_path)?;
+            let stale_rows_before = inspect_stale_rows(&state_db_path, repair_cwd)?;
             let target_version = current_codex_version();
             let process_output = run_repair_script(
                 &script_path,
                 &codex_home,
                 &state_db_path,
+                repair_cwd,
                 target_version.as_deref(),
             )?;
-            let stale_rows_after = inspect_stale_rows(&state_db_path)?;
+            let stale_rows_after = inspect_stale_rows(&state_db_path, repair_cwd)?;
 
             execution.script_path = Some(script_path);
             execution.backup_path = backup_path_from_output(&process_output.stdout);
@@ -373,7 +375,7 @@ pub fn execute_confirmed(
     }
 
     if repair_slow_path {
-        match apply_slow_path_repair() {
+        match apply_slow_path_repair(project_path) {
             Ok(slow_path_repair) => {
                 if slow_path_repair.launcher_updated || slow_path_repair.helper_updated {
                     execution.outcome = CodexRepairOutcome::Repaired;
@@ -467,16 +469,35 @@ fn install_embedded_tool(
     Ok(destination_path.to_path_buf())
 }
 
-fn inspect_stale_rows(path: &Path) -> Result<i64, GuardianError> {
+fn inspect_stale_rows(path: &Path, repair_cwd: Option<&Path>) -> Result<i64, GuardianError> {
     let connection = Connection::open(path)
         .map_err(|error| GuardianError::invalid_state(format!("sqlite open failed: {error}")))?;
-    connection
-        .query_row(
-            "select count(*) from threads where has_user_event = 0 and trim(coalesce(first_user_message, '')) <> ''",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| GuardianError::invalid_state(format!("stale row query failed: {error}")))
+    if let Some(repair_cwd) = repair_cwd {
+        let normalized = normalize_windows_cwd(repair_cwd);
+        connection
+            .query_row(
+                "select count(*) from threads where has_user_event = 0 and trim(coalesce(first_user_message, '')) <> '' and lower(replace(cwd,'\\\\?\\','')) = lower(?1)",
+                params![normalized],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                GuardianError::invalid_state(format!("scoped stale row query failed: {error}"))
+            })
+    } else {
+        connection
+            .query_row(
+                "select count(*) from threads where has_user_event = 0 and trim(coalesce(first_user_message, '')) <> ''",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| GuardianError::invalid_state(format!("stale row query failed: {error}")))
+    }
+}
+
+fn normalize_windows_cwd(path: &Path) -> String {
+    path.to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .replace('/', "\\")
 }
 
 fn inspect_old_unarchived_sessions(path: &Path, days: i64) -> Result<i64, GuardianError> {
@@ -579,12 +600,14 @@ fn run_repair_script(
     script_path: &Path,
     codex_home: &Path,
     state_db_path: &Path,
+    repair_cwd: Option<&Path>,
     target_version: Option<&str>,
 ) -> Result<ProcessOutput, GuardianError> {
     let bootstrap = render_repair_script_bootstrap(
         script_path,
         codex_home,
         state_db_path,
+        repair_cwd,
         target_version,
         resolve_codex_shim_path().as_deref(),
     );
@@ -730,7 +753,7 @@ fn backup_codex_config(
     Ok(Some(backup_path))
 }
 
-fn apply_slow_path_repair() -> Result<CodexSlowPathRepair, GuardianError> {
+fn apply_slow_path_repair(repair_cwd: Option<&Path>) -> Result<CodexSlowPathRepair, GuardianError> {
     let codex_home = codex_home_dir().map_err(GuardianError::Io)?;
     let script_path = ensure_repair_script_installed(&codex_home).map_err(GuardianError::Io)?;
     let helper_path = ensure_resume_picker_installed(&codex_home).map_err(GuardianError::Io)?;
@@ -753,6 +776,7 @@ fn apply_slow_path_repair() -> Result<CodexSlowPathRepair, GuardianError> {
         &script_path,
         &codex_home,
         &state_db_path,
+        repair_cwd,
         target_version.as_deref(),
     )?;
 
@@ -986,6 +1010,7 @@ fn render_repair_script_bootstrap(
     script_path: &Path,
     codex_home: &Path,
     state_db_path: &Path,
+    repair_cwd: Option<&Path>,
     target_version: Option<&str>,
     codex_shim_path: Option<&Path>,
 ) -> String {
@@ -1008,6 +1033,10 @@ fn render_repair_script_bootstrap(
     if let Some(target_version) = target_version {
         script_invocation.push_str(" -TargetVersion ");
         script_invocation.push_str(&quote_powershell_literal(target_version));
+    }
+    if let Some(repair_cwd) = repair_cwd {
+        script_invocation.push_str(" -RepairCwd ");
+        script_invocation.push_str(&quote_powershell_literal(repair_cwd));
     }
     commands.push(script_invocation);
 
@@ -1204,6 +1233,7 @@ mod tests {
             Path::new(r"C:\Users\Example\.codex\tools\repair-codex-resume.ps1"),
             Path::new(r"C:\Users\Example\.codex"),
             Path::new(r"C:\Users\Example\.codex\state_5.sqlite"),
+            Some(Path::new(r"D:\Desktop\CREATOR SIX")),
             Some("0.124.0"),
             Some(Path::new(r"C:\Users\Example\AppData\Roaming\npm\codex.cmd")),
         );
@@ -1212,6 +1242,7 @@ mod tests {
         assert!(bootstrap.contains("& cmd /d /c"));
         assert!(bootstrap.contains("codex.cmd\" --version 2>nul"));
         assert!(bootstrap.contains("-TargetVersion '0.124.0'"));
+        assert!(bootstrap.contains("-RepairCwd 'D:\\Desktop\\CREATOR SIX'"));
     }
 
     #[test]
@@ -1263,6 +1294,14 @@ mod tests {
         assert!(
             EMBEDDED_REPAIR_SCRIPT.contains("$StateDbPath"),
             "embedded script must accept the StateDbPath parameter"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("$RepairCwd"),
+            "embedded script must accept the RepairCwd parameter for folder-scoped stale-row repair"
+        );
+        assert!(
+            EMBEDDED_REPAIR_SCRIPT.contains("Scoped DB repair cwd:"),
+            "embedded script must report when stale-row repair is scoped to a single cwd"
         );
         assert!(
             EMBEDDED_RESUME_PICKER.contains(RESUME_PICKER_VERSION_MARKER),
